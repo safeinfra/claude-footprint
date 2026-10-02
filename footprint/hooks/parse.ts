@@ -690,12 +690,14 @@ function targets(rest: string[], fallbackKind?: string): Target[] {
   const first = rest[0]
   if (first === undefined) return fallbackKind ? [{ kind: fallbackKind }] : []
   if (first.includes('/')) {
-    return rest
-      .filter(r => r.includes('/'))
-      .map(r => {
-        const [k, ...name] = r.split('/')
-        return { kind: normalizeKind(k!), name: name.join('/') }
-      })
+    // Only the leading kind/name run: later args (`c=repo/img:tag`) are not targets.
+    const out: Target[] = []
+    for (const r of rest) {
+      if (!r.includes('/') || r.includes('=') || r.includes(':')) break
+      const [k, ...name] = r.split('/')
+      out.push({ kind: normalizeKind(k!), name: name.join('/') })
+    }
+    return out
   }
   if (fallbackKind) return [{ kind: fallbackKind, name: first }]
   const kinds = first.split(',').filter(Boolean)
@@ -827,6 +829,7 @@ export function analyze(command: string): Analysis {
     else if (Array.isArray(parsed)) actions.push(...parsed)
     else actions.push(parsed)
   }
+  for (const a of actions) if (a.resource !== undefined) a.resource = redact(a.resource)
   return { actions, unparsed }
 }
 
@@ -843,7 +846,7 @@ const MULTI_SECRET_OPT = new RegExp(
 )
 const FROM_LITERAL = new RegExp(`(--from-literal(?:=|\\s+))(${QUOTED}|[^\\s=]+=(?:${QUOTED}|\\S*)|\\S+)`, 'g')
 const ENV_SECRET = new RegExp(
-  `\\b([A-Za-z_][A-Za-z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)[A-Za-z0-9_]*)=(${QUOTED}|[^\\s;&|]*)`,
+  `(?<![\\w-])([A-Za-z_][A-Za-z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)[A-Za-z0-9_]*)=(${QUOTED}|[^\\s;&|]*)`,
   'gi',
 )
 const SSM_VALUE = new RegExp(`(\\bput-parameter\\b[^;&|]*?--value(?:=|\\s+))(${QUOTED}|[^\\s;&|]+)`, 'g')

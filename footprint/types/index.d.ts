@@ -33,7 +33,7 @@ export type KubeInfo = { status: 'pending' | 'ok' | 'error'; current?: string; n
 
 declare module 'claude-code' {
   interface PluginState {
-    'infra-map': {
+    'footprint': {
       events: MapEvent[]
       seq: number
       turnId: string | null

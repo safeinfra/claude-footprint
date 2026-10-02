@@ -92,6 +92,10 @@ const ROWS: Row[] = [
     { actions: [k({ kind: 'configmaps', resource: 'cfg', namespace: 'web' }), k({ kind: 'services', resource: 'api', namespace: 'edge' })] }],
   ['config use-context is read and switches', 'kubectl config use-context staging',
     { actions: [k({ kind: 'config', cls: 'read', useContext: 'staging' })] }],
+  ['set image ignores the image ref', 'kubectl set image deploy/api api=123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/api:v2',
+    { actions: [k({ verb: 'set image', kind: 'deployments', resource: 'api', cls: 'write' })] }],
+  ['resource is redacted', 'aws iam update-access-key --access-key-id AKIAABCDEFGHIJKLMNOP --status Inactive',
+    { actions: [aws({ cls: 'write', resource: 'AKIA****************' })] }],
   ['sudo/timeout wrappers', 'sudo -E timeout 30 kubectl get nodes', { actions: [k({ kind: 'nodes', namespace: '(cluster)' })] }],
 ]
 
@@ -152,7 +156,8 @@ describe('redact', () => {
     ['access key id', 'echo AKIAABCDEFGHIJKLMNOP', 'echo AKIA****************'],
     ['ssm put-parameter value', 'aws ssm put-parameter --name /x --value s3cr3t --type SecureString',
       'aws ssm put-parameter --name /x --value *** --type SecureString'],
-    ['names stay', 'aws secretsmanager get-secret-value --secret-id prod/db', 'aws secretsmanager get-secret-value --secret-id prod/db'],
+    ['--key= is a name, not a secret', 'aws s3api get-object --bucket b --key=path/obj out', 'aws s3api get-object --bucket b --key=path/obj out'],
+    ['names stay','aws secretsmanager get-secret-value --secret-id prod/db', 'aws secretsmanager get-secret-value --secret-id prod/db'],
   ]
   for (const [name, input, output] of table) {
     test(name, () => expect(redact(input)).toBe(output))

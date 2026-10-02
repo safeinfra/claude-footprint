@@ -27,19 +27,28 @@ aws acct-a w1 d1 cred2 ✗1 │ k8s prod-eks w1 │ acct-b r4
 
 ## Install
 
-```bash
-claude plugin marketplace add aqaurius6666/claude-footprint
+In Claude Code:
+
+```
+/plugin marketplace add aqaurius6666/claude-footprint
+/plugin install footprint@footprint
 ```
 
+footprint uses function hooks, so start Claude Code with them turned on:
+
 ```bash
-claude plugin install footprint@footprint
+CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude
 ```
+
+**Claude Desktop (and other GUI launches):** the app does not read your shell's environment. Put `"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"` in the `env` block of `~/.claude/settings.json` and restart the app.
 
 Or load a checkout for one session:
 
 ```bash
-claude --plugin-dir /path/to/claude-footprint
+CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir /path/to/claude-footprint
 ```
+
+The mod runs `aws sts get-caller-identity --profile <p>` and `aws configure get region --profile <p>` once per profile your commands name, and `kubectl config current-context` / `kubectl config view` once, as child processes. All read-only; only the account id is kept.
 
 Mods draw in the terminal and the desktop Code tab. `claude -p` and VS Code run the hooks but draw nothing.
 

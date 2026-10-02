@@ -29,4 +29,5 @@ Deviations from the v1 spec, and what was planned instead.
 - `kubectl apply -f dir/` and URLs show as one `manifest` row (no directory walk, no fetch).
 - `kubectl config set-context --current --namespace=x` does not update the cached default namespace.
 - Hot reload: all state is in `$.state` and pending lookups are restarted from `session.start`, but no live reload was run in this session. Writing into `~/.claude/dev-mods/<session>/` was blocked by the local permit hook, so live loading is **not verified**.
+- Spec step "load the mod once, read the generated `.claude-plugin/types/`" was not possible (the mod never loaded here). The API authority used instead was the plugin-authoring skill's `claude-code.d.ts`, written by the same engine build (2.1.286 header; CLI reports 2.1.287), plus `anthropics/claude-code` `mods/diff` and `aqaurius6666/claude-env-badge`.
 - The claude.dev post "Getting started with Claude Code mods" was read (Blast Radius / Replay Theater patterns); its first URL guess 404'd.

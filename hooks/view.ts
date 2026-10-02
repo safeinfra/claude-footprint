@@ -320,6 +320,12 @@ export function rowText(r: Row): string {
 /** Text of the tree as the pane draws it, one string per row; for tests and the line budget. */
 export const treeLines = (groups: Group[]): string[] => rowsOf(groups).map(rowText)
 
+/** Where one event ran, caches filled in: `aws acct-a (1234…9012) ap-ne-1` or `k8s prod-eks web`. */
+export function scopeText(e: MapEvent, ctx: Pick<Ctx, 'profiles' | 'kube'>): string {
+  const p = place(e, { ...ctx, turnId: null, filter: 'all', expanded: {} }, new Map())
+  return `${p.tool === 'aws' ? 'aws' : 'k8s'} ${p.head} ${p.section}`
+}
+
 export function noteText(n: Note): string {
   return `${n.ok ? '' : '✗ '}${n.verb}${n.resource ? ` ${n.resource}` : ''}`
 }

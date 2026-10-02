@@ -47,6 +47,9 @@ export const ALL_NS = '*'
 export const CLUSTER_NS = '(cluster)'
 
 const MENTIONS = /\b(?:safe-)?(?:aws|kubectl)\b/
+
+/** Cheap gate so `ls -la` never reaches the lexer or state. */
+export const mentionsInfra = (command: string) => MENTIONS.test(command)
 const TOOLS: Record<string, 'aws' | 'kubectl'> = {
   aws: 'aws',
   'safe-aws': 'aws',

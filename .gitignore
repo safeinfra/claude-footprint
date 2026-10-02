@@ -1,4 +1,5 @@
-footprint/.claude-plugin/types/
-footprint/tsconfig.json
+# written by /plugin-types and by the engine on load; regenerate per Claude Code version
 .claude/types/
+.claude-plugin/types/
 node_modules/
+bun.lock

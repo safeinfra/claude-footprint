@@ -1,4 +1,5 @@
-import { describe, expect, test } from 'claude-code/testing'
+// bun test: pure parser. Named *.spec.ts so `claude plugin test` (which runs *.test.ts[x]) skips it.
+import { describe, expect, test } from 'bun:test'
 
 import { analyze, classifyAws, lex, normalizeKind, parseManifest, redact } from '../hooks/parse'
 

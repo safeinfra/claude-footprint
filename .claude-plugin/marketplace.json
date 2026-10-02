@@ -1,0 +1,13 @@
+{
+  "name": "footprint",
+  "owner": {
+    "name": "nguyen.duy.vu"
+  },
+  "plugins": [
+    {
+      "name": "footprint",
+      "source": "./",
+      "description": "Live map of the aws and kubectl commands Claude runs: accounts, regions, clusters, namespaces, and whether each action read, wrote, destroyed or exposed credentials."
+    }
+  ]
+}

@@ -35,7 +35,6 @@ declare module 'claude-code' {
   interface PluginState {
     'footprint': {
       events: MapEvent[]
-      seq: number
       turnId: string | null
       filter: Filter
       expanded: Record<string, boolean>

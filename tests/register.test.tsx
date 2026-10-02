@@ -73,8 +73,31 @@ const map = (args = '') => ({
 const texts = async (ui: { findAll: (q: { type?: string }) => Promise<{ text: string }[]> }) =>
   (await ui.findAll({ type: 'Box' })).map(b => b.text)
 
-async function twoAccountsOneCluster($: Engine) {
+const ACCOUNTS: Record<string, string> = { 'acct-a': '123456789012', 'acct-a-admin': '123456789012', 'acct-b': '210987654321' }
+const REGIONS: Record<string, string> = { 'acct-a': 'ap-northeast-1', 'acct-a-admin': 'ap-northeast-1', 'acct-b': 'us-east-1' }
+
+/** The host's aws and kubectl answering the mod's lookups. */
+function hostRun(argv: readonly string[]): { exitCode: number; stdout: string } {
+  const [bin, a, b, , profile] = argv
+  if (bin === 'aws' && a === 'sts' && b === 'get-caller-identity') {
+    const account = ACCOUNTS[profile ?? '']
+    return account
+      ? { exitCode: 0, stdout: JSON.stringify({ UserId: 'AID:me', Account: account, Arn: `arn:aws:sts::${account}:assumed-role/Admin/me` }) }
+      : { exitCode: 255, stdout: '' }
+  }
+  if (bin === 'aws' && a === 'configure') {
+    const region = REGIONS[argv[5] ?? '']
+    return region ? { exitCode: 0, stdout: `${region}\n` } : { exitCode: 1, stdout: '' }
+  }
+  if (bin === 'kubectl' && b === 'current-context') return { exitCode: 0, stdout: 'prod-eks\n' }
+  if (bin === 'kubectl' && b === 'view') return { exitCode: 0, stdout: 'prod-eks\tweb\nstaging\t\n' }
+  return { exitCode: 1, stdout: '' }
+}
+
+async function twoAccountsOneCluster($: Engine, on: On) {
+  const w = world(on, { run: hostRun })
   await $.session.start(SESSION)
+  await w.clock.settle()
   await $.turn.start({ text: 'one', turnId: 't1' })
   for (const command of [
     'aws --profile acct-a ec2 describe-instances',
@@ -88,6 +111,8 @@ async function twoAccountsOneCluster($: Engine) {
   await $.turn.start({ text: 'two', turnId: 't2' })
   await $.tool.call({ tool: 'Bash', command: 'kubectl --context prod-eks -n web get pods' })
   await $.tool.call({ tool: 'Bash', command: 'kubectl --context prod-eks -n web create secret generic db --from-literal=password=hunter2' })
+  await w.clock.settle()
+  return w
 }
 
 const band = (bodyColumns = 120, hasSurvey = false) => ({
@@ -143,12 +168,11 @@ test('denied calls are not recorded', async ($, on) => {
 })
 
 test('pane: tree with collapsed read-only group, notable rows visible', async ($, on) => {
-  world(on)
-  await twoAccountsOneCluster($)
+  await twoAccountsOneCluster($, on)
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ ...pane(), surface })
-    expect((await ui.find({ key: 'group-1' }))?.text).toBe('▾ aws › acct-a')
-    expect((await ui.find({ key: 'group-2' }))?.text).toBe('▸ aws › acct-b › ?')
+    expect((await ui.find({ key: 'group-1' }))?.text).toBe('▾ aws › acct-a (1234…9012)')
+    expect((await ui.find({ key: 'group-2' }))?.text).toBe('▸ aws › acct-b (2109…4321) › us-e-1')
     expect((await ui.find({ key: 'group-3' }))?.text).toBe('▾ k8s › prod-eks › web')
     const all = (await texts(ui)).join('\n')
     expect(all).toContain('terminate-instances i-0abc')
@@ -160,20 +184,18 @@ test('pane: tree with collapsed read-only group, notable rows visible', async ($
 })
 
 test('pane: a group header toggles expanded', async ($, on) => {
-  world(on)
-  await twoAccountsOneCluster($)
+  await twoAccountsOneCluster($, on)
   const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
   await ui.press({ key: 'group-2' })
-  expect((await ui.find({ key: 'group-2' }))?.text).toBe('▾ aws › acct-b › ?')
+  expect((await ui.find({ key: 'group-2' }))?.text).toBe('▾ aws › acct-b (2109…4321) › us-e-1')
   expect((await texts(ui)).join('\n')).toContain('describe-vpcs')
   await ui.press({ key: 'group-2' })
-  expect((await ui.find({ key: 'group-2' }))?.text).toBe('▸ aws › acct-b › ?')
+  expect((await ui.find({ key: 'group-2' }))?.text).toBe('▸ aws › acct-b (2109…4321) › us-e-1')
   await ui.unmount()
 })
 
 test('pane: write and turn filters', async ($, on) => {
-  world(on)
-  await twoAccountsOneCluster($)
+  await twoAccountsOneCluster($, on)
   const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
   await ui.press({ key: 'filter-write' })
   expect((await texts(ui)).join('\n')).not.toContain('acct-b')
@@ -186,8 +208,7 @@ test('pane: write and turn filters', async ($, on) => {
 })
 
 test('pane: selecting a row shows its redacted command, never the output', async ($, on) => {
-  world(on)
-  await twoAccountsOneCluster($)
+  await twoAccountsOneCluster($, on)
   const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
   const row = await ui.find({ type: 'Button', text: /secrets/ })
   expect(row).toBeDefined()
@@ -223,14 +244,100 @@ test('/map on a narrow terminal falls back to the band', async ($, on) => {
 })
 
 test('/map clear empties the map; /map collapse folds groups', async ($, on) => {
-  world(on)
-  await twoAccountsOneCluster($)
+  await twoAccountsOneCluster($, on)
   const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
   await ui.press({ key: 'group-2' })
   await $.command.run(map('collapse'))
-  expect((await ui.find({ key: 'group-2' }))?.text).toBe('▸ aws › acct-b › ?')
+  expect((await ui.find({ key: 'group-2' }))?.text).toBe('▸ aws › acct-b (2109…4321) › us-e-1')
   await $.command.run(map('clear'))
   expect((await texts(ui)).join('\n')).toContain('No aws or kubectl calls yet.')
   expect(await bandText($)).toBe('engine band')
   await ui.unmount()
+})
+
+async function paneText($: Engine): Promise<string> {
+  const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
+  const all = (await texts(ui)).slice(1).join('\n')
+  await ui.unmount()
+  return all
+}
+
+test('scope: two profiles on one account merge; the caller ARN is never kept', async ($, on) => {
+  const w = world(on, { run: hostRun })
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-a ec2 describe-vpcs' })
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-a-admin ec2 delete-vpc --vpc-id vpc-1' })
+  await w.clock.settle()
+  const all = await paneText($)
+  expect(all).toContain('▾ aws › acct-a (1234…9012) › ap-ne-1')
+  expect(all).not.toContain('acct-a-admin (')
+  expect(all).not.toContain('assumed-role')
+})
+
+test('scope: process AWS_PROFILE/AWS_REGION apply when the command names none', async ($, on) => {
+  const w = world(on, { run: hostRun, env: { AWS_PROFILE: 'acct-b', AWS_REGION: 'eu-west-1' } })
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'Bash', command: 'aws ec2 describe-vpcs' })
+  await w.clock.settle()
+  expect(await paneText($)).toContain('aws › acct-b (2109…4321) › eu-w-1')
+})
+
+test('scope: an unresolvable profile shows (?) and region ?', async ($, on) => {
+  const w = world(on, { run: hostRun })
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile ghost ec2 describe-vpcs' })
+  await w.clock.settle()
+  expect(await paneText($)).toContain('aws › ghost (?) › ?')
+})
+
+test('kubectl: default namespace from the kubeconfig; use-context pins earlier rows', async ($, on) => {
+  const w = world(on, { run: hostRun })
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'Bash', command: 'kubectl delete pod web-1' })
+  await w.clock.settle()
+  await $.tool.call({ tool: 'Bash', command: 'kubectl config use-context staging' })
+  await $.tool.call({ tool: 'Bash', command: 'kubectl scale deploy api --replicas 0' })
+  await w.clock.settle()
+  const all = await paneText($)
+  expect(all).toContain('▾ k8s › prod-eks › web')
+  expect(all).toContain('delete web-1')
+  expect(all).toContain('▾ k8s › staging')
+  expect(all).toContain('scale api')
+})
+
+test('kubectl -f: kind and name come from the manifest file', async ($, on) => {
+  const w = world(on, {
+    run: hostRun,
+    files: {
+      '/work/deploy/api.yaml': 'apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\n  namespace: edge\n---\nkind: ClusterRole\nmetadata:\n  name: reader\n',
+    },
+  })
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'Bash', command: 'cd deploy && kubectl --context prod-eks apply -f api.yaml' })
+  await $.tool.call({ tool: 'Bash', command: 'kubectl --context prod-eks apply -f missing.yaml' })
+  await w.clock.settle()
+  const all = await paneText($)
+  expect(all).toMatch(/edge\s+deployments\s+w1 · apply api/)
+  expect(all).toMatch(/cluster\s+clusterroles\s+w1 · apply reader/)
+  expect(all).toMatch(/manifest\s+w1 · apply missing.yaml/)
+})
+
+test('edges: assume-role and update-kubeconfig show as link rows', async ($, on) => {
+  const w = world(on, { run: hostRun })
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-b sts get-caller-identity' })
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-a sts assume-role --role-arn arn:aws:iam::210987654321:role/Deploy --role-session-name s' })
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-a eks update-kubeconfig --name prod-eks' })
+  await w.clock.settle()
+  expect(await paneText($)).toContain('→ link: aws acct-b (2109…4321) (role Deploy) · k8s prod-eks')
+})
+
+test('a failed call is marked and its badge counted', async ($, on) => {
+  const w = world(on, { run: hostRun, fails: c => c.includes(' rm ') })
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-a s3 rm s3://b/k' })
+  await w.clock.settle()
+  const all = await paneText($)
+  expect(all).toContain('d1 ✗1')
+  expect(all).toContain('· ✗ rm s3://b/k')
 })

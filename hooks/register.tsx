@@ -3,7 +3,8 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Cls, Filter, MapEvent } from '../types'
 
-import { analyze, mentionsInfra, redact } from './parse'
+import { analyze, CLUSTER_KINDS, CLUSTER_NS, mentionsInfra, normalizeKind, parseManifest, redact } from './parse'
+import type { Action } from './parse'
 import { appendEvents, eventsOf } from './record'
 import { badges, bandTokens, buildGroups, groupHeader, noteText, rowsOf, scopeText } from './view'
 import type { Ctx, Row } from './view'
@@ -32,14 +33,128 @@ const COLOR: Record<Cls | 'failed', string | undefined> = {
 }
 const ACCENT = 'cyan'
 
+const ACCOUNT_ID = /^\d{12}$/
+
+/** Account id (never the caller ARN) and configured region of one profile, off the tool call's path. */
+async function resolveProfile($: EngineInterface, profile: string): Promise<void> {
+  const [id, region] = await Promise.all([
+    $.process
+      .run(['aws', 'sts', 'get-caller-identity', '--profile', profile, '--output', 'json'], { timeoutMs: 15_000 })
+      .catch(() => null),
+    $.process.run(['aws', 'configure', 'get', 'region', '--profile', profile], { timeoutMs: 5_000 }).catch(() => null),
+  ])
+  let account: string | undefined
+  if (id?.exitCode === 0) {
+    try {
+      const parsed = (JSON.parse(id.stdout) as { Account?: unknown }).Account
+      if (typeof parsed === 'string' && ACCOUNT_ID.test(parsed)) account = parsed
+    } catch {
+      // Unreadable answer: the account stays unknown.
+    }
+  }
+  const configured = region?.exitCode === 0 ? region.stdout.trim() : ''
+  await update($, profiles, m => ({
+    ...m,
+    [profile]: {
+      status: account ? ('ok' as const) : ('error' as const),
+      ...(account ? { account } : {}),
+      ...(configured ? { region: configured } : {}),
+    },
+  }))
+}
+
+/** Current context and each context's default namespace, from the kubeconfig. */
+async function resolveKube($: EngineInterface): Promise<void> {
+  const [cur, view] = await Promise.all([
+    $.process.run(['kubectl', 'config', 'current-context'], { timeoutMs: 5_000 }).catch(() => null),
+    $.process
+      .run(['kubectl', 'config', 'view', '-o', 'jsonpath={range .contexts[*]}{.name}{"\\t"}{.context.namespace}{"\\n"}{end}'], {
+        timeoutMs: 5_000,
+      })
+      .catch(() => null),
+  ])
+  const current = cur?.exitCode === 0 ? cur.stdout.trim() : ''
+  const ns: Record<string, string> = {}
+  if (view?.exitCode === 0) {
+    for (const line of view.stdout.split('\n')) {
+      const [name, namespace] = line.split('\t')
+      if (name && namespace) ns[name] = namespace.trim()
+    }
+  }
+  await update($, kube, k => {
+    const known = k?.current ?? (current || undefined)
+    return { status: known ? ('ok' as const) : ('error' as const), ...(known ? { current: known } : {}), ns }
+  })
+  // Rows recorded before the answer ran against this context: pin them before a later switch moves them.
+  if (current) await update($, events, list => pinContext(list, current))
+}
+
+const pinContext = (list: MapEvent[], context: string): MapEvent[] =>
+  list.map(e => (e.tool === 'kubectl' && e.scope.context === undefined ? { ...e, scope: { ...e.scope, context } } : e))
+
+/** Starts each lookup once: marks it pending, then runs it from a timer so the tool call never waits. */
+async function kick($: EngineInterface, add: readonly { tool: string; scope: { profile?: string } }[]): Promise<void> {
+  const names = new Set(add.flatMap(e => (e.tool === 'aws' && e.scope.profile !== undefined ? [e.scope.profile] : [])))
+  for (const profile of names) {
+    let isMine = false
+    await update($, profiles, m => {
+      isMine = m[profile] === undefined
+      return isMine ? { ...m, [profile]: { status: 'pending' as const } } : m
+    })
+    if (isMine) $.clock.after(0, () => void resolveProfile($, profile).catch(() => undefined))
+  }
+  if (add.some(e => e.tool === 'kubectl')) {
+    let isMine = false
+    await update($, kube, k => {
+      isMine = k === null
+      return isMine ? { status: 'pending' as const, ns: {} } : k
+    })
+    if (isMine) $.clock.after(0, () => void resolveKube($).catch(() => undefined))
+  }
+}
+
+/** `-f file` actions become one action per manifest document; unreadable files stay as `manifest`. */
+async function expandManifests($: EngineInterface, actions: Action[]): Promise<Action[]> {
+  const out: Action[] = []
+  let base: string | undefined
+  for (const a of actions) {
+    if (a.tool !== 'kubectl' || a.file === undefined) {
+      out.push(a)
+      continue
+    }
+    base ??= await $.session.cwd()
+    const dir = a.cwd == null ? base : a.cwd.startsWith('/') ? a.cwd : `${base}/${a.cwd}`
+    const path = a.file.startsWith('/') ? a.file : `${dir}/${a.file}`
+    let docs: ReturnType<typeof parseManifest> = []
+    try {
+      docs = parseManifest(String(await $.fs.read(path)))
+    } catch {
+      // Missing, a directory, too big or remote: keep the file name.
+    }
+    const { file: _file, cwd: _cwd, ...rest } = a
+    if (docs.length === 0) {
+      out.push(rest)
+      continue
+    }
+    for (const d of docs) {
+      const kind = normalizeKind(d.kind)
+      const namespace = CLUSTER_KINDS.has(kind) ? CLUSTER_NS : d.namespace ?? a.namespace
+      out.push({ ...rest, kind, ...(d.name ? { resource: d.name } : {}), ...(namespace ? { namespace } : {}) })
+    }
+  }
+  return out
+}
+
 async function record($: EngineInterface, command: string, ok: boolean): Promise<void> {
   const found = analyze(command)
   if (found.actions.length === 0 && found.unparsed === 0) return
   if (found.unparsed > 0) await update($, unparsed, n => n + found.unparsed)
   if (found.actions.length === 0) return
 
-  const hasAws = found.actions.some(a => a.tool === 'aws')
-  const add = eventsOf(found.actions, {
+  const actions = await expandManifests($, found.actions)
+  const hasAws = actions.some(a => a.tool === 'aws')
+  // Context switches are kubeconfig bookkeeping, not infra: applied below, not drawn.
+  const add = eventsOf(actions.filter(a => a.tool !== 'kubectl' || a.kind !== 'config'), {
     ts: await $.clock.now(),
     turnId: await read($, turn),
     ok,
@@ -50,6 +165,16 @@ async function record($: EngineInterface, command: string, ok: boolean): Promise
     kube: await read($, kube),
   })
   await update($, events, list => appendEvents(list, add))
+
+  // `config use-context X`: earlier rows keep the old context, later ones get X.
+  const switched = ok ? actions.findLast(a => a.tool === 'kubectl' && a.useContext !== undefined) : undefined
+  if (switched?.tool === 'kubectl' && switched.useContext !== undefined) {
+    const before = (await read($, kube))?.current
+    if (before !== undefined) await update($, events, list => pinContext(list, before))
+    const next = switched.useContext
+    await update($, kube, k => ({ status: 'ok' as const, ns: k?.ns ?? {}, current: next }))
+  }
+  await kick($, add)
 }
 
 async function ctxOf($: EngineInterface, view: Pick<Ctx, 'filter' | 'expanded'>): Promise<Ctx> {
@@ -77,6 +202,11 @@ export const register: Register = on => {
       argumentHint: '[all|write|turn|collapse|clear]',
       immediate: true,
     })
+    // A hot reload drops pending timers: restart lookups the old module left pending.
+    for (const [profile, info] of Object.entries(await read($, profiles))) {
+      if (info.status === 'pending') $.clock.after(0, () => void resolveProfile($, profile).catch(() => undefined))
+    }
+    if ((await read($, kube))?.status === 'pending') $.clock.after(0, () => void resolveKube($).catch(() => undefined))
     return started
   })
 
@@ -120,6 +250,9 @@ export const register: Register = on => {
       await update($, events, () => [])
       await update($, unparsed, () => 0)
       await update($, selected, () => null)
+      // Forget lookups too, so a profile that failed (expired SSO) is asked again.
+      await update($, profiles, () => ({}))
+      await update($, kube, () => null)
       return { text: 'Footprint: map cleared.' }
     }
     return { text: USAGE }
@@ -166,7 +299,7 @@ export const register: Register = on => {
       bs.map(([b, cls]) => <Text color={COLOR[cls]} dimColor={cls === 'read'}> {b}</Text>)
 
     const drawRow = (r: Row) => {
-      if (r.type === 'links') return <Text wrap="truncate-end">{r.text}</Text>
+      if (r.type === 'links') return <Box><Text wrap="truncate-end">{r.text}</Text></Box>
       if (r.type === 'group') {
         const g = r.group
         const head = groupHeader(g)
@@ -184,7 +317,7 @@ export const register: Register = on => {
         )
       }
       const l = r.line
-      if (l.type === 'more') return <Text dimColor>{` ${r.prefix}    +${l.count} more`}</Text>
+      if (l.type === 'more') return <Box><Text dimColor>{` ${r.prefix}    +${l.count} more`}</Text></Box>
       if (l.type === 'res') {
         return (
           <Box flexDirection="row">

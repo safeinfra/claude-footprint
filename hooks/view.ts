@@ -104,7 +104,9 @@ function place(e: MapEvent, ctx: Ctx, labelOf: Map<string, string>): Placed {
     const group = account !== undefined ? `aws:${account}` : `aws:p:${e.scope.profile}`
     if (!labelOf.has(group)) labelOf.set(group, e.scope.profile)
     const name = labelOf.get(group)!
-    const head = account !== undefined ? `${name} (${shortAccount(account)})` : name
+    const status = ctx.profiles[e.scope.profile]?.status
+    // Pending and failed lookups stay visibly unknown, never blank.
+    const head = account !== undefined ? `${name} (${shortAccount(account)})` : status === 'error' ? `${name} (?)` : status === 'pending' ? `${name} (…)` : name
     const region = e.isGlobal ? 'global' : e.scope.region ?? ctx.profiles[e.scope.profile]?.region
     return { group, tool: 'aws', head, short: name, section: region === undefined ? '?' : shortRegion(region), leaf: e.service }
   }

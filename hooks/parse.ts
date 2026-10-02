@@ -855,10 +855,32 @@ const ENV_SECRET = new RegExp(
 const SSM_VALUE = new RegExp(`(\\bput-parameter\\b[^;&|]*?--value(?:=|\\s+))(${QUOTED}|[^\\s;&|]+)`, 'g')
 const BEARER = /(Authorization:\s*(?:Bearer|Basic|token)\s+)[^\s'"]+/gi
 const ACCESS_KEY = /\b(AKIA|ASIA)[A-Z0-9]{16}\b/g
+// A heredoc body can be a Secret manifest or a JSON payload: keep its size, not its text.
+const HEREDOC = /(<<-?[ \t]*(['"]?)([\w.-]+)\2[^\n]*\n)([\s\S]*?)\n(\t*\3)(?=\n|$)/g
+const URL_CREDS = /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@'"]+:)[^\s@/'"]+@/gi
+const CURL_USER = /(\s(?:-u|--user)(?:=|\s+)['"]?[^\s:'"]+:)[^\s'"]+/g
+const DOCKER_P = /(\b(?:docker|podman|helm\s+registry)\s+login\b[^;&|\n]*?\s-p(?:=|\s+))(\S+)/g
+const CONFIGURE_SET = /(\bconfigure\s+set\s+\S*(?:secret|token|key|password)\S*\s+)(\S+)/gi
+const KNOWN_TOKENS = [
+  /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/g, // JWT
+  /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g, // GitHub
+  /\bgithub_pat_[A-Za-z0-9_]{30,}\b/g,
+  /\bxox[abposr]-[A-Za-z0-9-]{10,}\b/g, // Slack
+  /\bglpat-[A-Za-z0-9_-]{20,}\b/g, // GitLab
+]
 
 /** The command with secret values masked, safe to keep in state and show. */
 export function redact(command: string): string {
-  return command
+  let out = command.replace(HEREDOC, (_m, head: string, _q, _d, body: string, end: string) => {
+    const lines = body === '' ? 0 : body.split('\n').length
+    return `${head}[heredoc: ${lines} line${lines === 1 ? '' : 's'} hidden]\n${end}`
+  })
+  for (const token of KNOWN_TOKENS) out = out.replace(token, '***')
+  return out
+    .replace(URL_CREDS, '$1***@')
+    .replace(CURL_USER, '$1***')
+    .replace(DOCKER_P, '$1***')
+    .replace(CONFIGURE_SET, '$1***')
     .replace(SECRET_OPT, '$1***')
     .replace(MULTI_SECRET_OPT, '$1***')
     .replace(FROM_LITERAL, (_m, pre: string, value: string) => {

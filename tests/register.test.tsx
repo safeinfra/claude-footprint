@@ -21,12 +21,12 @@ function world(on: On, w: World = {}) {
   on('session.cwd', () => ({ value: '/work' }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('tool.call', ($, e) => {
-    const command = String(e.command ?? '')
+    const command = e.tool === 'Bash' ? e.command : ''
     if (w.denies?.(command)) return { deny: 'no' }
     if (w.fails?.(command)) return { isError: true as const, result: 'boom', text: 'boom' }
     return { result: { stdout: 'SECRET-OUTPUT', stderr: '', interrupted: false } }
   })
-  on('process.run', ($, e) => ({ value: { stderr: '', ...(w.run?.(e.argv) ?? { exitCode: 1, stdout: '' }) } }))
+  on('process.run', ($, e) => ({ value: { stderr: '', isStdoutTruncated: false, isStderrTruncated: false, ...(w.run?.(e.argv) ?? { exitCode: 1, stdout: '' }) } }))
   on('fs.read', ($, e) => {
     const text = w.files?.[e.path]
     if (text === undefined) throw new Error(`ENOENT ${e.path}`)

@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type { Cls, Filter, MapEvent } from '../types'
 
@@ -93,8 +93,8 @@ const pinContext = (list: MapEvent[], context: string): MapEvent[] =>
   list.map(e => (e.tool === 'kubectl' && e.scope.context === undefined ? { ...e, scope: { ...e.scope, context } } : e))
 
 /** Starts each lookup once: marks it pending, then runs it from a timer so the tool call never waits. */
-async function kick($: EngineInterface, add: readonly { tool: string; scope: { profile?: string } }[]): Promise<void> {
-  const names = new Set(add.flatMap(e => (e.tool === 'aws' && e.scope.profile !== undefined ? [e.scope.profile] : [])))
+async function kick($: EngineInterface, add: readonly ({ tool: 'aws'; scope: { profile: string } } | { tool: 'kubectl' })[]): Promise<void> {
+  const names = new Set(add.flatMap(e => (e.tool === 'aws' ? [e.scope.profile] : [])))
   for (const profile of names) {
     let isMine = false
     await update($, profiles, m => {
@@ -266,7 +266,7 @@ export const register: Register = on => {
     if (groups.length === 0) return next(e)
     const { tokens, dropped } = bandTokens(groups, e.props.bodyColumns)
     const { Box, Text } = await $.ui.resolve(e)
-    const parts: unknown[] = []
+    const parts: RenderChildren[] = []
     tokens.forEach((t, i) => {
       if (i > 0) parts.push(<Text dimColor> │ </Text>)
       if (t.prefix) parts.push(<Text bold>{t.prefix} </Text>)

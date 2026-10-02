@@ -1,0 +1,4 @@
+{
+  "description": "infra-map: captures aws/kubectl Bash calls and draws them as a /map pane and a band above the prompt",
+  "modules": ["./register.tsx"]
+}

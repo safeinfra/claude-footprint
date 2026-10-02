@@ -1,0 +1,4 @@
+infra-map/.claude-plugin/types/
+infra-map/tsconfig.json
+.claude/types/
+node_modules/

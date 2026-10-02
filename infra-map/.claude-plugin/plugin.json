@@ -1,0 +1,6 @@
+{
+  "name": "infra-map",
+  "version": "0.1.0",
+  "description": "Live map of the aws and kubectl commands Claude runs: which account, region, cluster and namespace were touched, and whether each action read, wrote, destroyed or exposed credentials.",
+  "types": "./types/index.d.ts"
+}

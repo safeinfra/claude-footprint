@@ -1,0 +1,80 @@
+name: bump-version
+
+# On every push to main, bump .claude-plugin/plugin.json from the Conventional
+# Commit subjects since the last version change:
+#   feat!: / BREAKING CHANGE -> major, feat: -> minor, fix:/perf:/refactor: -> patch,
+#   anything else (docs/test/chore/ci) -> no bump.
+# workflow_dispatch forces a bump of the chosen level.
+# Pushes made with GITHUB_TOKEN do not re-trigger workflows, so no loop.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      level:
+        description: Bump level
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bump-version
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide bump level
+        id: level
+        env:
+          FORCED: ${{ inputs.level }}
+        run: |
+          if [ -n "$FORCED" ]; then
+            echo "level=$FORCED" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          file=.claude-plugin/plugin.json
+          # Last commit that changed the version line = previous release point.
+          base=$(git log -1 --format=%H -G'"version"' -- "$file")
+          range=${base:+$base..}HEAD
+          msgs=$(git log --no-merges --format='%s%n%b' "$range")
+          level=none
+          if printf '%s\n' "$msgs" | grep -qE '^[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE'; then
+            level=major
+          elif printf '%s\n' "$msgs" | grep -qE '^feat(\([^)]*\))?:'; then
+            level=minor
+          elif printf '%s\n' "$msgs" | grep -qE '^(fix|perf|refactor)(\([^)]*\))?:'; then
+            level=patch
+          fi
+          echo "range=$range level=$level"
+          echo "level=$level" >> "$GITHUB_OUTPUT"
+
+      - name: Bump, commit, tag, push
+        if: steps.level.outputs.level != 'none'
+        env:
+          LEVEL: ${{ steps.level.outputs.level }}
+        run: |
+          file=.claude-plugin/plugin.json
+          cur=$(jq -r .version "$file")
+          IFS=. read -r major minor patch <<< "$cur"
+          case "$LEVEL" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          next="$major.$minor.$patch"
+          jq --indent 2 --arg v "$next" '.version = $v' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: bump version to $next"
+          git tag "v$next"
+          git push origin HEAD:main "v$next"
+          echo "Bumped $cur -> $next ($LEVEL)" >> "$GITHUB_STEP_SUMMARY"

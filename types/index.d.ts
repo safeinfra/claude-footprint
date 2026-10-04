@@ -1,4 +1,5 @@
-export type Cls = 'read' | 'write' | 'destructive' | 'cred' | 'interactive'
+/** `unknown`: an MCP tool neither its server nor its name says is read-only. */
+export type Cls = 'read' | 'write' | 'destructive' | 'cred' | 'interactive' | 'unknown'
 
 export type Filter = 'all' | 'write' | 'turn'
 
@@ -19,14 +20,20 @@ export type EventBase = {
   resource?: string
   cls: Cls
   ok: boolean
-  /** The whole Bash command, redacted. */
+  /** Which path the call took: a Bash command or an MCP tool. */
+  source: 'cli' | 'mcp'
+  /** What ran, for the detail pane: the redacted Bash command, or `tool key=value ...` with allowlisted args. */
   cmd: string
+  /** The Bash tool's own one-line `description` of the call, redacted; MCP calls have none. */
+  description?: string
   link?: Link
 }
 
 export type AwsEvent = EventBase & { tool: 'aws'; scope: AwsScope; service: string; isGlobal: boolean }
 export type KubeEvent = EventBase & { tool: 'kubectl'; scope: KubeScope; kind: string }
-export type MapEvent = AwsEvent | KubeEvent
+/** An MCP call no adapter maps to aws/kubectl: `verb` is the tool name, `resource` the target arg. */
+export type McpEvent = EventBase & { tool: 'mcp'; server: string }
+export type MapEvent = AwsEvent | KubeEvent | McpEvent
 
 export type ProfileInfo = { status: 'pending' | 'ok' | 'error'; account?: string; region?: string }
 export type KubeInfo = { status: 'pending' | 'ok' | 'error'; current?: string; ns: Record<string, string> }
@@ -38,10 +45,13 @@ declare module 'claude-code' {
       turnId: string | null
       filter: Filter
       expanded: Record<string, boolean>
-      selected: number | null
+      /** Selected row key: every call behind it shows in the detail area. */
+      selected: string | null
       profiles: Record<string, ProfileInfo>
       kube: KubeInfo | null
       unparsed: number
+      /** Calls the history cap pushed out. */
+      dropped: number
     }
   }
 }

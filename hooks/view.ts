@@ -1,6 +1,7 @@
 // Pure view model: events + caches + view state in, rows out. No `$`.
 import type { Cls, Filter, KubeInfo, MapEvent, ProfileInfo } from '../types'
 
+import { shortServer } from './mcp'
 import { ALL_NS, CLUSTER_NS } from './parse'
 
 export type Ctx = {
@@ -11,60 +12,7 @@ export type Ctx = {
   expanded: Record<string, boolean>
 }
 
-export type Counts = { read: number; write: number; destructive: number; cred: number; interactive: number; failed: number }
-
-export type Note = { verb: string; resource?: string; cls: Cls; ok: boolean }
-
-export type Line =
-  | { type: 'svc'; name: string; counts: Counts; note?: Note; isCurrent: boolean; eventId: number }
-  | { type: 'reads'; names: string[]; total: number; isCurrent: boolean; eventId: number }
-  | { type: 'res'; note: Note; isCurrent: boolean; eventId: number }
-  | { type: 'more'; count: number }
-
-export type Section = { label: string | null; lines: Line[] }
-
-export type Mode = 'collapsed' | 'normal' | 'expanded'
-
-export type Group = {
-  key: string
-  tool: 'aws' | 'kubectl'
-  /** Chain-collapsed path: `aws › acct-A (1234…9012) › ap-ne-1`. */
-  title: string
-  /** Short name for the band. */
-  short: string
-  counts: Counts
-  isNotable: boolean
-  isCurrent: boolean
-  mode: Mode
-  sections: Section[]
-  links: string[]
-  /** Read service names, for a collapsed header. */
-  readNames: string[]
-}
-
-const NOTABLE: ReadonlySet<Cls> = new Set(['write', 'destructive', 'cred'])
-const RANK: Record<Cls, number> = { destructive: 4, cred: 3, write: 2, interactive: 1, read: 0 }
-const TOP_RESOURCES = 3
-
-const zero = (): Counts => ({ read: 0, write: 0, destructive: 0, cred: 0, interactive: 0, failed: 0 })
-const add = (c: Counts, e: MapEvent) => {
-  c[e.cls]++
-  if (!e.ok) c.failed++
-}
-
-export const isNotable = (e: MapEvent) => NOTABLE.has(e.cls) || !e.ok
-
-/** `ap-northeast-1` → `ap-ne-1`. */
-export function shortRegion(region: string): string {
-  return region
-    .split('-')
-    .map((part, i) =>
-      i === 0 ? part : part.replace(/north/g, 'n').replace(/south/g, 's').replace(/east/g, 'e').replace(/west/g, 'w').replace(/central/g, 'c'),
-    )
-    .join('-')
-}
-
-export const shortAccount = (id: string) => (id.length === 12 ? `${id.slice(0, 4)}…${id.slice(8)}` : id)
+const RANK: Record<Cls, number> = { destructive: 5, cred: 4, write: 3, interactive: 2, unknown: 1, read: 0 }
 
 /** EKS context ARNs to the cluster name; anything else as is. */
 export const shortContext = (ctx: string) => /^arn:aws[\w-]*:eks:[^:]*:\d*:cluster\/(.+)$/.exec(ctx)?.[1] ?? ctx
@@ -75,272 +23,262 @@ export function shortResource(r: string): string {
   return s.length > 40 ? `${s.slice(0, 39)}…` : s
 }
 
-export function badges(c: Counts, withReads = true): [string, Cls | 'failed'][] {
-  const out: [string, Cls | 'failed'][] = []
-  if (withReads && c.read > 0) out.push([`r${c.read}`, 'read'])
-  if (c.write > 0) out.push([`w${c.write}`, 'write'])
-  if (c.destructive > 0) out.push([`d${c.destructive}`, 'destructive'])
-  if (c.cred > 0) out.push([`cred${c.cred}`, 'cred'])
-  if (c.interactive > 0) out.push([`i${c.interactive}`, 'interactive'])
-  if (c.failed > 0) out.push([`✗${c.failed}`, 'failed'])
-  return out
-}
-
 export function filterEvents(events: readonly MapEvent[], filter: Filter, turnId: string | null): MapEvent[] {
   if (filter === 'write') return events.filter(e => e.cls !== 'read')
   if (filter === 'turn') return turnId === null ? [] : events.filter(e => e.turnId === turnId)
   return [...events]
 }
 
-type Placed = { group: string; tool: 'aws' | 'kubectl'; head: string; short: string; section: string; leaf: string }
+const accountOf = (e: MapEvent & { tool: 'aws' }, profiles: Ctx['profiles']) => e.scope.account ?? profiles[e.scope.profile]?.account
 
-function accountOf(e: MapEvent & { tool: 'aws' }, ctx: Ctx): string | undefined {
-  return e.scope.account ?? ctx.profiles[e.scope.profile]?.account
+// Sections by outcome, then where it ran, then object rows.
+
+export type Outcome = 'changed' | 'maybe' | 'failed' | 'looked'
+
+const SECTIONS: readonly { outcome: Outcome; label: string }[] = [
+  { outcome: 'changed', label: 'CHANGED' },
+  { outcome: 'maybe', label: 'MAY HAVE CHANGED' },
+  { outcome: 'failed', label: 'FAILED, NEVER SUCCEEDED' },
+  { outcome: 'looked', label: 'LOOKED AT' },
+]
+
+/** `expanded` key that opens the LOOKED AT section. */
+export const LOOKED_OPEN = 'looked'
+
+export type CallRow = {
+  /** Selection key; stable when the row moves between sections. */
+  key: string
+  object: string
+  /** Empty when the object already names the operation (MCP tool with no target). */
+  op: string
+  /** Service or kind: `rds`, `pods`. */
+  topic: string
+  /** Highest class among the row's calls; drives colour only. */
+  cls: Cls
+  outcome: Outcome
+  /** `same call 2 times, last one worked`. */
+  says: string
+  /** `opens AWS account 210987654321, role Deploy`. */
+  links: string[]
+  isCurrent: boolean
+  /** Oldest first. */
+  events: MapEvent[]
+  where: string
 }
 
-function place(e: MapEvent, ctx: Ctx, labelOf: Map<string, string>): Placed {
+export type ScopeBlock = { key: string; where: string; rows: CallRow[] }
+export type MapSection = { outcome: Outcome; label: string; rows: number; scopes: ScopeBlock[]; topics: string[] }
+
+/** Where one event ran, in words: `AWS account 437984728688 · ap-northeast-1`. No level is invented. */
+export function whereOf(e: MapEvent, ctx: Pick<Ctx, 'profiles' | 'kube'>): { key: string; text: string } {
+  if (e.tool === 'mcp') return { key: `mcp:${e.server}`, text: shortServer(e.server) }
   if (e.tool === 'aws') {
-    const account = accountOf(e, ctx)
-    const group = account !== undefined ? `aws:${account}` : `aws:p:${e.scope.profile}`
-    if (!labelOf.has(group)) labelOf.set(group, e.scope.profile)
-    const name = labelOf.get(group)!
-    const status = ctx.profiles[e.scope.profile]?.status
+    const info = ctx.profiles[e.scope.profile]
+    const account = accountOf(e, ctx.profiles)
+    const region = e.isGlobal ? 'global' : e.scope.region ?? info?.region
+    const regionText = region ?? 'region unknown'
+    if (account !== undefined) return { key: `aws:${account}:${region ?? '?'}`, text: `AWS account ${account} · ${regionText}` }
     // Pending and failed lookups stay visibly unknown, never blank.
-    const head = account !== undefined ? `${name} (${shortAccount(account)})` : status === 'error' ? `${name} (?)` : status === 'pending' ? `${name} (…)` : name
-    const region = e.isGlobal ? 'global' : e.scope.region ?? ctx.profiles[e.scope.profile]?.region
-    return { group, tool: 'aws', head, short: name, section: region === undefined ? '?' : shortRegion(region), leaf: e.service }
+    const state = info?.status === 'pending' ? 'account not looked up yet' : 'account unknown'
+    return { key: `aws:p:${e.scope.profile}:${region ?? '?'}`, text: `AWS profile ${e.scope.profile} · ${state} · ${regionText}` }
   }
-  const context = e.scope.context ?? ctx.kube?.current ?? '?'
-  const ns = e.scope.namespace ?? ctx.kube?.ns[context] ?? 'default'
-  const short = shortContext(context)
-  return {
-    group: `k8s:${context}`,
-    tool: 'kubectl',
-    head: short,
-    short,
-    section: ns === ALL_NS ? 'all-ns' : ns === CLUSTER_NS ? 'cluster' : ns,
-    leaf: e.kind,
-  }
+  const context = e.scope.context ?? ctx.kube?.current
+  const ns = e.scope.namespace ?? (context !== undefined ? ctx.kube?.ns[context] : undefined) ?? 'default'
+  const nsText = ns === ALL_NS ? 'all namespaces' : ns === CLUSTER_NS ? 'cluster-wide' : `namespace ${ns}`
+  return { key: `k8s:${context ?? '?'}:${ns}`, text: `Kubernetes ${context !== undefined ? shortContext(context) : 'context unknown'} · ${nsText}` }
 }
 
-function noteOf(e: MapEvent): Note {
-  return { verb: e.verb, resource: e.resource === undefined ? undefined : shortResource(e.resource), cls: e.cls, ok: e.ok }
+/** `deployments` → `deployment`, only in front of a name. */
+const singular = (kind: string) =>
+  kind.endsWith('ies') ? `${kind.slice(0, -3)}y` : kind.endsWith('sses') || kind.endsWith('ches') ? kind.slice(0, -2) : kind.endsWith('s') ? kind.slice(0, -1) : kind
+
+/**
+ * Object first, real operation after. AWS calls with no named resource use the service.
+ * `topic` (service or kind) names the row in a folded LOOKED AT line.
+ */
+function objectOf(e: MapEvent): { object: string; op: string; topic: string } {
+  const named = e.resource === undefined ? undefined : shortResource(e.resource)
+  if (e.tool === 'mcp') return named === undefined ? { object: e.verb, op: '', topic: e.verb } : { object: named, op: e.verb, topic: e.verb }
+  if (e.tool === 'aws') return { object: named === undefined ? e.service : `${e.service} ${named}`, op: e.verb, topic: e.service }
+  return { object: named === undefined ? e.kind : `${singular(e.kind)} ${named}`, op: e.verb, topic: e.kind }
 }
 
-/** The most telling event: failed or highest class, newest on ties. */
-function latestNotable(list: MapEvent[]): MapEvent | undefined {
-  let best: MapEvent | undefined
-  for (const e of list) {
-    if (!isNotable(e)) continue
-    if (best === undefined || RANK[e.cls] >= RANK[best.cls]) best = e
-  }
-  return best
+function outcomeOf(list: readonly MapEvent[]): Outcome {
+  const worked = list.filter(e => e.ok)
+  if (worked.length === 0) return 'failed'
+  if (worked.some(e => e.cls === 'write' || e.cls === 'destructive')) return 'changed'
+  if (worked.some(e => e.cls !== 'read')) return 'maybe'
+  return 'looked'
 }
 
-function resourceLines(list: MapEvent[], turnId: string | null): Line[] {
-  const seen = new Map<string, MapEvent[]>()
-  for (const e of list) {
-    const k = `${e.verb}\u0000${e.resource ?? ''}`
-    seen.set(k, [...(seen.get(k) ?? []), e])
-  }
-  const entries = [...seen.values()].sort((a, b) => {
-    const ra = Math.max(...a.map(e => RANK[e.cls] + (e.ok ? 0 : 5)))
-    const rb = Math.max(...b.map(e => RANK[e.cls] + (e.ok ? 0 : 5)))
-    return rb - ra || b.at(-1)!.id - a.at(-1)!.id
-  })
-  const lines: Line[] = entries.slice(0, TOP_RESOURCES).map(es => {
-    const last = es.at(-1)!
-    const worst = es.reduce((w, e) => (RANK[e.cls] + (e.ok ? 0 : 5) > RANK[w.cls] + (w.ok ? 0 : 5) ? e : w))
-    return { type: 'res', note: noteOf(worst), isCurrent: es.some(e => e.turnId === turnId && turnId !== null), eventId: last.id }
-  })
-  if (entries.length > TOP_RESOURCES) lines.push({ type: 'more', count: entries.length - TOP_RESOURCES })
-  return lines
+/** Short retry wording for a row: `2 calls, last worked`. Same versus different commands is in the detail. */
+export function saysOf(list: readonly MapEvent[]): string {
+  const n = list.length
+  const last = list.at(-1)!
+  if (n === 1) return last.ok ? 'worked' : 'failed'
+  if (list.every(e => !e.ok)) return `${n} calls, all failed`
+  if (list.every(e => e.ok)) return `${n} calls`
+  return `${n} calls, last ${last.ok ? 'worked' : 'failed'}`
 }
 
-/** The tree: one group per account/context, in first-seen order so hotkeys stay put. */
-export function buildGroups(all: readonly MapEvent[], ctx: Ctx): Group[] {
+/** Same call = same stored command string. */
+function sameness(list: readonly MapEvent[]): string {
+  const distinct = new Set(list.map(e => e.cmd)).size
+  return distinct === 1 ? 'same command' : `${distinct} different commands`
+}
+
+function linkText(e: MapEvent): string | undefined {
+  if (!e.link) return undefined
+  if (e.link.to === 'aws') return `opens AWS account ${e.link.account}${e.link.role ? `, role ${e.link.role}` : ''}`
+  return `opens Kubernetes ${e.link.context ?? e.link.cluster}`
+}
+
+/** Filter, bucket by where + object + operation, then section by outcome. Order: first seen. */
+export function buildMap(all: readonly MapEvent[], ctx: Ctx): MapSection[] {
   const events = filterEvents(all, ctx.filter, ctx.turnId)
-  const labelOf = new Map<string, string>()
-  const groups = new Map<string, { tool: 'aws' | 'kubectl'; head: string; short: string; sections: Map<string, Map<string, MapEvent[]>>; links: string[] }>()
-
+  const buckets = new Map<string, { scopeKey: string; where: string; object: string; op: string; topic: string; events: MapEvent[] }>()
   for (const e of events) {
-    const p = place(e, ctx, labelOf)
-    let g = groups.get(p.group)
-    if (!g) {
-      g = { tool: p.tool, head: p.head, short: p.short, sections: new Map(), links: [] }
-      groups.set(p.group, g)
-    }
-    const section = g.sections.get(p.section) ?? new Map<string, MapEvent[]>()
-    g.sections.set(p.section, section)
-    section.set(p.leaf, [...(section.get(p.leaf) ?? []), e])
-    if (e.link) {
-      const target =
-        e.link.to === 'aws'
-          ? `aws ${labelFor(e.link.account, ctx)}${e.link.role ? ` (role ${e.link.role})` : ''}`
-          : `k8s ${e.link.context ?? e.link.cluster}`
-      if (!g.links.includes(target)) g.links.push(target)
-    }
+    const w = whereOf(e, ctx)
+    const { object, op, topic } = objectOf(e)
+    const key = `${w.key}\u0000${object}\u0000${op}`
+    const b = buckets.get(key) ?? { scopeKey: w.key, where: w.text, object, op, topic, events: [] }
+    buckets.set(key, b)
+    b.events.push(e)
   }
 
-  const out: Group[] = []
-  for (const [key, g] of groups) {
-    const counts = zero()
-    let isCurrent = false
-    const readNames: string[] = []
-    for (const leaves of g.sections.values()) {
-      for (const [name, list] of leaves) {
-        list.forEach(e => add(counts, e))
-        if (list.some(e => e.turnId === ctx.turnId && ctx.turnId !== null)) isCurrent = true
-        if (!list.some(isNotable) && !readNames.includes(name)) readNames.push(name)
-      }
+  const sections = new Map(SECTIONS.map(s => [s.outcome, new Map<string, ScopeBlock>()]))
+  for (const [key, b] of buckets) {
+    const outcome = outcomeOf(b.events)
+    const links = [...new Set(b.events.map(linkText).filter((t): t is string => t !== undefined))]
+    const row: CallRow = {
+      key,
+      object: b.object,
+      op: b.op,
+      topic: b.topic,
+      cls: b.events.reduce((w, e) => (RANK[e.cls] > RANK[w] ? e.cls : w), 'read' as Cls),
+      outcome,
+      says: saysOf(b.events),
+      links,
+      isCurrent: ctx.turnId !== null && b.events.some(e => e.turnId === ctx.turnId),
+      events: b.events,
+      where: b.where,
     }
-    const notable = counts.write + counts.destructive + counts.cred + counts.failed > 0
-    const isExpanded = ctx.expanded[key] === true
-    const mode: Mode = isExpanded ? 'expanded' : notable ? 'normal' : 'collapsed'
-    const tool = g.tool === 'aws' ? 'aws' : 'k8s'
-    const isSingle = g.sections.size === 1
-    const title = isSingle ? `${tool} › ${g.head} › ${[...g.sections.keys()][0]}` : `${tool} › ${g.head}`
+    const scopes = sections.get(outcome)!
+    const block = scopes.get(b.scopeKey) ?? { key: b.scopeKey, where: b.where, rows: [] }
+    scopes.set(b.scopeKey, block)
+    block.rows.push(row)
+  }
 
-    const sections: Section[] = []
-    if (mode !== 'collapsed') {
-      for (const [label, leaves] of g.sections) {
-        const lines: Line[] = []
-        const reads: { name: string; list: MapEvent[] }[] = []
-        for (const [name, list] of leaves) {
-          const c = zero()
-          list.forEach(e => add(c, e))
-          const cur = list.some(e => e.turnId === ctx.turnId && ctx.turnId !== null)
-          const hasNotable = list.some(isNotable)
-          if (mode === 'normal' && !hasNotable) {
-            reads.push({ name, list })
-            continue
-          }
-          const top = latestNotable(list) ?? list.at(-1)!
-          lines.push({ type: 'svc', name, counts: c, note: hasNotable ? noteOf(top) : undefined, isCurrent: cur, eventId: top.id })
-          if (mode === 'expanded') lines.push(...resourceLines(list, ctx.turnId))
-        }
-        if (reads.length > 0) {
-          const flat = reads.flatMap(r => r.list)
-          lines.push({
-            type: 'reads',
-            names: reads.map(r => r.name),
-            total: flat.length,
-            isCurrent: flat.some(e => e.turnId === ctx.turnId && ctx.turnId !== null),
-            eventId: flat.reduce((a, b) => (b.id > a.id ? b : a)).id,
-          })
-        }
-        sections.push({ label: isSingle ? null : label, lines })
-      }
+  return SECTIONS.map(({ outcome, label }) => {
+    const scopes = [...sections.get(outcome)!.values()]
+    // Several operations on one object stay together, in first-seen order.
+    for (const s of scopes) {
+      const order = [...new Set(s.rows.map(r => r.object))]
+      s.rows.sort((a, b) => order.indexOf(a.object) - order.indexOf(b.object))
     }
-    out.push({ key, tool: g.tool, title, short: g.short, counts, isNotable: notable, isCurrent, mode, sections, links: g.links, readNames })
+    const rows = scopes.flatMap(s => s.rows)
+    return { outcome, label, rows: rows.length, scopes, topics: [...new Set(rows.map(r => r.topic))] }
+  })
+}
+
+/** `rollback (change), failed`: a failed change may have changed something partway. */
+export function rowOpText(r: CallRow): string {
+  const tag = r.cls === 'write' || r.cls === 'destructive' ? '(change)' : '(may have changed)'
+  const op = r.outcome === 'failed' && r.cls !== 'read' ? `${r.op} ${tag}`.trimStart() : r.op
+  return op === '' ? r.says : `${op}, ${r.says}`
+}
+
+export type PaneRow =
+  | { type: 'section'; key: string; section: MapSection; text: string; isFoldable: boolean }
+  | { type: 'scope'; key: string; text: string }
+  | { type: 'call'; key: string; row: CallRow; object: string; text: string }
+  | { type: 'note'; key: string; text: string }
+
+const MAX_OBJECT = 28
+
+/** The pane's rows, one per screen line. CHANGED always shows; LOOKED AT folds to one line unless opened. */
+export function paneRows(sections: readonly MapSection[], expanded: Ctx['expanded'] = {}): PaneRow[] {
+  const out: PaneRow[] = []
+  for (const s of sections) {
+    if (s.rows === 0 && s.outcome !== 'changed') continue
+    const isFolded = s.outcome === 'looked' && expanded[LOOKED_OPEN] !== true
+    const head = `${s.label} (${s.rows})`
+    out.push({
+      type: 'section',
+      key: `section-${s.outcome}`,
+      section: s,
+      text: isFolded ? `${head} · ${s.topics.join(', ')}` : head,
+      isFoldable: s.outcome === 'looked',
+    })
+    if (s.rows === 0) out.push({ type: 'note', key: `note-${s.outcome}`, text: '  nothing changed' })
+    if (isFolded) continue
+    for (const block of s.scopes) {
+      out.push({ type: 'scope', key: `scope-${s.outcome}-${block.key}`, text: `  ${block.where}` })
+      const width = Math.min(MAX_OBJECT, Math.max(...block.rows.map(r => r.object.length)))
+      block.rows.forEach((r, i) => {
+        // Several operations on one object: name it once.
+        const name = i > 0 && block.rows[i - 1]!.object === r.object ? '' : r.object
+        const object = `    ${name.padEnd(width)}  `
+        out.push({ type: 'call', key: `call-${r.key}`, row: r, object, text: rowOpText(r) })
+        for (const l of r.links) out.push({ type: 'note', key: `link-${r.key}-${l}`, text: `      ${l}` })
+      })
+    }
+    if (s.outcome === 'looked') out.push({ type: 'note', key: 'note-looked', text: '  ran without error; results are not recorded' })
   }
   return out
 }
 
-function labelFor(account: string, ctx: Ctx): string {
-  for (const [profile, info] of Object.entries(ctx.profiles)) {
-    if (info.account === account) return `${profile} (${shortAccount(account)})`
-  }
-  return shortAccount(account)
+export const paneRowText = (r: PaneRow): string => (r.type === 'call' ? `${r.object}${r.text}`.trimEnd() : r.text)
+
+/** Text of the pane list, one string per row; for tests. */
+export const mapLines = (sections: readonly MapSection[], expanded: Ctx['expanded'] = {}): string[] => paneRows(sections, expanded).map(paneRowText)
+
+const hhmm = (ts: number) => {
+  const d = new Date(ts)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-export type BandToken = { prefix?: string; label: string; badges: [string, Cls | 'failed'][] }
-
-const tokenWidth = (t: BandToken) =>
-  (t.prefix ? t.prefix.length + 1 : 0) + t.label.length + t.badges.reduce((n, [b]) => n + b.length + 1, 0)
-
 /**
- * One line: `aws acct-A w1 d1 cred1 │ k8s prod-eks w1 │ acct-B r4`. Notable
- * groups first; read-only ones are dropped first when it does not fit.
+ * Detail for one row: every call behind it, oldest first. The AWS profile is added
+ * only when the command does not name it already (`AWS_PROFILE`, default).
  */
-export function bandTokens(groups: Group[], columns: number): { tokens: BandToken[]; dropped: number } {
-  const ordered = [...groups.filter(g => g.isNotable), ...groups.filter(g => !g.isNotable)]
-  const seen = new Set<string>()
-  const tokens: BandToken[] = ordered.map(g => {
-    const tool = g.tool === 'aws' ? 'aws' : 'k8s'
-    const prefix = seen.has(tool) ? undefined : tool
-    seen.add(tool)
-    return { prefix, label: g.short, badges: badges(g.counts, !g.isNotable) }
-  })
-  const SEP = 3
-  const width = (ts: BandToken[], dropped: number) =>
-    ts.reduce((n, t) => n + tokenWidth(t), 0) + SEP * Math.max(0, ts.length - 1) + (dropped > 0 ? ` +${dropped}`.length : 0)
-  let dropped = 0
-  while (tokens.length > 1 && width(tokens, dropped) > columns) {
-    const lastRead = tokens.map((t, i) => [t, i] as const).reverse().find(([, i]) => !ordered[i]!.isNotable)
-    tokens.splice(lastRead ? lastRead[1] : tokens.length - 1, 1)
-    ordered.splice(lastRead ? lastRead[1] : ordered.length - 1, 1)
-    dropped++
+export function detailLines(r: CallRow): { head: string; calls: { head: string; cmd: string; ok: boolean }[]; where: string } {
+  const n = r.events.length
+  const count = n === 1 ? '1 call' : `${n} calls, ${sameness(r.events)}`
+  return {
+    head: [r.object, r.op, count].filter(Boolean).join(' · '),
+    // Time, outcome and the call's own description on one line; the command below it.
+    calls: r.events.map(e => {
+      const profile = e.tool === 'aws' && !e.cmd.includes(e.scope.profile) ? [`profile ${e.scope.profile}`] : []
+      return { ok: e.ok, head: [hhmm(e.ts), e.ok ? 'worked' : 'failed', ...profile, ...(e.description ? [e.description] : [])].join('  '), cmd: e.cmd }
+    }),
+    where: r.where,
   }
-  return { tokens, dropped }
 }
 
-export type Row =
-  | { type: 'group'; key: string; index: number; group: Group }
-  | { type: 'line'; key: string; prefix: string; line: Line }
-  | { type: 'links'; key: string; text: string }
-
 /**
- * The pane's rows, one per screen line. A group with several regions or
- * namespaces puts the label in a left column instead of a line of its own.
+ * Every recorded call as JSON lines, scope filled in from the caches, oldest first.
+ * Same redacted text the pane shows; tool output is never stored, so never exported.
  */
-export function rowsOf(groups: Group[]): Row[] {
-  const rows: Row[] = []
-  groups.forEach((g, index) => {
-    rows.push({ type: 'group', key: `group-${index + 1}`, index, group: g })
-    const width = Math.max(0, ...g.sections.map(s => (s.label === null ? 0 : s.label.length + 1)))
-    g.sections.forEach((s, si) => {
-      s.lines.forEach((line, li) => {
-        const label = li === 0 && s.label !== null ? s.label : ''
-        rows.push({ type: 'line', key: `row-${index + 1}-${si}-${li}`, prefix: `  ${label.padEnd(width)}`, line })
+export function traceJsonl(events: readonly MapEvent[], ctx: Pick<Ctx, 'profiles' | 'kube'>): string {
+  return events
+    .map(e => {
+      const { object, op } = objectOf(e)
+      return JSON.stringify({
+        time: new Date(e.ts).toISOString(),
+        turn: e.turnId,
+        outcome: e.ok ? 'worked' : 'failed',
+        class: e.cls,
+        tool: e.tool === 'mcp' ? `mcp ${e.server}` : e.tool,
+        where: whereOf(e, ctx).text,
+        ...(e.tool === 'aws' ? { profile: e.scope.profile } : {}),
+        object,
+        ...(op ? { operation: op } : {}),
+        ...(e.description ? { description: e.description } : {}),
+        command: e.cmd,
+        ...(e.link ? { opens: linkText(e) } : {}),
       })
     })
-    if (g.mode !== 'collapsed' && g.links.length > 0) {
-      rows.push({ type: 'links', key: `links-${index + 1}`, text: `  → link: ${g.links.join(' · ')}` })
-    }
-  })
-  return rows
-}
-
-export function groupHeader(g: Group): { marker: string; title: string; badges: [string, Cls | 'failed'][]; extra: string } {
-  return {
-    marker: g.mode === 'collapsed' ? '▸' : '▾',
-    title: g.title,
-    badges: badges(g.counts, g.mode === 'collapsed' || !g.isNotable),
-    extra: g.mode === 'collapsed' && g.readNames.length > 0 ? ` · ${g.readNames.join(', ')}` : '',
-  }
-}
-
-export function rowText(r: Row): string {
-  if (r.type === 'links') return r.text
-  if (r.type === 'line') return r.prefix + lineText(r.line)
-  const h = groupHeader(r.group)
-  const hk = r.index < 9 ? `${r.index + 1}: ` : ''
-  return `${hk}${h.marker} ${h.title}  ${h.badges.map(([b]) => b).join(' ')}${h.extra}`
-}
-
-/** Text of the tree as the pane draws it, one string per row; for tests and the line budget. */
-export const treeLines = (groups: Group[]): string[] => rowsOf(groups).map(rowText)
-
-/** Where one event ran, caches filled in: `aws acct-a (1234…9012) ap-ne-1` or `k8s prod-eks web`. */
-export function scopeText(e: MapEvent, ctx: Pick<Ctx, 'profiles' | 'kube'>): string {
-  const p = place(e, { ...ctx, turnId: null, filter: 'all', expanded: {} }, new Map())
-  return `${p.tool === 'aws' ? 'aws' : 'k8s'} ${p.head} ${p.section}`
-}
-
-export function noteText(n: Note): string {
-  return `${n.ok ? '' : '✗ '}${n.verb}${n.resource ? ` ${n.resource}` : ''}`
-}
-
-export function lineText(l: Line): string {
-  switch (l.type) {
-    case 'svc':
-      return `${l.name}  ${badges(l.counts).map(([b]) => b).join(' ')}${l.note ? ` · ${noteText(l.note)}` : ''}`
-    case 'reads':
-      return `${l.names.join(', ')} · read-only (${l.total})`
-    case 'res':
-      return `  ${noteText(l.note)}`
-    case 'more':
-      return `  +${l.count} more`
-  }
+    .map(line => `${line}\n`)
+    .join('')
 }

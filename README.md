@@ -3,27 +3,26 @@
 A Claude Code mod that keeps a live map of the `aws` and `kubectl` commands Claude runs: which account and region, which cluster and namespace, and whether each action **read**, **wrote**, **destroyed** or **exposed credentials**.
 
 ```
-1: ▾ aws › acct-a (1234…9012)  w1 d1 cred2 ✗1
-  ap-ne-1 ec2  r4 d1 · terminate-instances i-0abc
-          ecr  cred1 · get-login-password
-          lambda  r1 w1 ✗1 · ✗ update-function-configuration api
-          logs, rds, eks · read-only (3)
-  global  sts  r1 cred1 · assume-role Deploy
-          iam, s3 · read-only (2)
-  → link: aws acct-b (2109…4321) (role Deploy) · k8s prod-eks
-2: ▸ aws › acct-b (2109…4321) › us-e-1  r4 · ec2, s3, cloudwatch
-3: ▾ k8s › prod-eks › web  w1
-  deployments  r2 w1 · rollout restart api
-  pods, services, events, horizontalpodautoscalers · read-only (8)
+CHANGED (2)
+  AWS account 123456789012 · ap-northeast-1
+    ec2 i-0abc  terminate-instances, worked
+  Kubernetes prod-eks · namespace web
+    deployment api  rollout restart, worked
+MAY HAVE CHANGED (2)
+  AWS account 123456789012 · ap-northeast-1
+    ecr  get-login-password, worked
+  AWS account 123456789012 · global
+    sts Deploy  assume-role, worked
+      opens AWS account 210987654321, role Deploy
+FAILED, NEVER SUCCEEDED (1)
+  AWS account 123456789012 · ap-northeast-1
+    lambda api  update-function-configuration (change), failed
+LOOKED AT (24) · ec2, lambda, logs, rds, eks, iam, sts, s3, cloudwatch, pods, deployments, services, events, horizontalpodautoscalers
 ```
 
-Above the prompt, one line sums it up:
+It draws nothing in the main window: the map lives only in the `/map` pane.
 
-```
-aws acct-a w1 d1 cred2 ✗1 │ k8s prod-eks w1 │ acct-b r4
-```
-
-> **Display only.** The parser reads the command text. Commands hidden in scripts, Terraform, Helm or SDKs do not show. **A missing row does not mean nothing happened.** It never blocks or rewrites a tool call.
+> **Display only.** The parser reads the command text, or an MCP tool's name and arguments. MCP reads are not drawn yet, and a tool its server marks read-only is not drawn even if it writes. Commands hidden in scripts, Terraform, Helm or SDKs do not show. **A missing row does not mean nothing happened.** It never blocks or rewrites a tool call.
 
 ## Install
 
@@ -60,20 +59,28 @@ Mods draw in the terminal and the desktop Code tab. `claude -p` and VS Code run 
 | `/map write` | Only write, destructive, cred and interactive actions |
 | `/map turn` | Only the current turn |
 | `/map all` | Everything |
-| `/map collapse` | Fold every group back to its default |
+| `/map collapse` | Fold LOOKED AT back to one line |
+| `/map export` | Write every recorded call to `~/.claude/footprint/trace-<session>.jsonl` |
 | `/map clear` | Empty the map and forget account lookups |
 
-In the pane (focus it with ctrl+x tab): `1`–`9` toggle a group, `a` / `w` / `t` pick a filter, `c` folds all. Select a row to see its full command, redacted, at the bottom.
+In the pane (focus it with ctrl+x tab): `l` opens or folds LOOKED AT, `a` / `w` / `t` pick a filter, `c` folds, `e` exports. Select a row to see every call behind it at the bottom: time, worked or failed, the AWS profile when the command does not name it, the Bash tool's own description, then the full command, redacted.
 
-On a terminal too narrow for the pane, `/map` says so and the band stays the view.
+The export is one JSON object per call (time, turn, outcome, class, where, profile, object, operation, description, command), unfiltered, the same redacted text the pane shows. Each export of a session overwrites its file, and its path goes on the clipboard. Calls past the 500-call history cap are gone and not in it.
+
+On a terminal too narrow for the pane, `/map` says so; calls are still recorded and `/map export` still works.
 
 ## How to read it
 
-- `r12 w1 d1 cred1 i2 ✗1`: reads, writes, destructive, credential, interactive, failed.
-- Colors: write yellow, destructive red, cred magenta, interactive cyan, read dim.
-- `•` marks rows touched in the current turn; older rows are dim.
-- Groups with only reads fold to one line. Groups with any write, destructive or cred action stay open, so those actions are always visible.
-- `acct-a (…)` is still looking up the account; `acct-a (?)` could not (expired SSO, no credentials). Region `?` means none was given or configured.
+
+
+- Sections by outcome: `CHANGED` (a write or delete that worked; always shown), `MAY HAVE CHANGED` (credentials, interactive shells, MCP tools not known to be read-only), `FAILED, NEVER SUCCEEDED` (every try failed; `(change)` marks a change, which may have done something partway), `LOOKED AT` (reads, folded to one line).
+- Under each: where it ran (`AWS account … · region`, `Kubernetes cluster · namespace`, or the MCP server), then one row per object and operation.
+- `3 calls, last worked` counts tries. The detail says whether they were the `same command` or `N different commands` (flag order or `--output json` counts as different).
+- `worked` is exit status only. The output is never recorded, so `LOOKED AT` does not mean anything was found.
+- `account not looked up yet` / `account unknown` (expired SSO, no credentials) and `region unknown` are said, never guessed.
+- Colour is the action class only (write yellow, destructive red, cred magenta, interactive cyan); a failure is told by its section, not by colour.
+- `•` marks rows touched in the current turn. `older calls dropped` means the 500-call history cap pushed some out.
+
 
 ## Scope
 
@@ -118,7 +125,7 @@ bun x -p typescript tsc --noEmit -p .
 
 - `hooks/parse.ts`: shell lexer, `aws` / `kubectl` argv parsing, classification, redaction. Pure.
 - `hooks/record.ts`: parsed actions to stored events. Pure.
-- `hooks/view.ts`: events to groups, rows and the band. Pure.
+- `hooks/view.ts`: events to sections, rows, detail and the export. Pure.
 - `hooks/register.tsx`: hooks, state, lookups, drawing.
 - `types/index.d.ts`: the `$.state` contract.
 

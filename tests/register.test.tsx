@@ -6,8 +6,11 @@ const SESSION = { surface: 'terminal' as const, isInteractive: true, cwd: '/work
 const SURFACES = ['terminal', 'desktop'] as const
 
 type World = {
+  /** Sees the Bash command, or the tool name for any other tool. */
   fails?: (command: string) => boolean
   denies?: (command: string) => boolean
+  /** Tools whose server declares them read-only. */
+  readOnly?: (tool: string) => boolean
   run?: (argv: readonly string[]) => { exitCode: number; stdout: string }
   files?: Record<string, string>
   env?: Record<string, string>
@@ -19,12 +22,19 @@ function world(on: On, w: World = {}) {
   const clock = mock.clock(on, { now: 1_000 })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.cwd', () => ({ value: '/work' }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  const written: Record<string, string> = {}
+  on('fs.write', ($, e) => {
+    written[e.path] = e.text
+    return { value: undefined }
+  })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('tool.call', ($, e) => {
-    const command = e.tool === 'Bash' ? e.command : ''
+    const command = e.tool === 'Bash' ? e.command : e.tool
     if (w.denies?.(command)) return { deny: 'no' }
     if (w.fails?.(command)) return { isError: true as const, result: 'boom', text: 'boom' }
-    return { result: { stdout: 'SECRET-OUTPUT', stderr: '', interrupted: false } }
+    const ro = w.readOnly?.(e.tool) ? { isReadOnly: true as const } : {}
+    return { result: { stdout: 'SECRET-OUTPUT', stderr: '', interrupted: false }, ...ro }
   })
   on('process.run', ($, e) => ({ value: { stderr: '', isStdoutTruncated: false, isStderrTruncated: false, ...(w.run?.(e.argv) ?? { exitCode: 1, stdout: '' }) } }))
   on('fs.read', ($, e) => {
@@ -52,7 +62,7 @@ function world(on: On, w: World = {}) {
   on('ui.panes', () => ({
     value: [...panes].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
   }))
-  return { clock, panes, opened }
+  return { clock, panes, opened, written }
 }
 
 const pane = (bodyColumns = 80) => ({
@@ -115,82 +125,57 @@ async function twoAccountsOneCluster($: Engine, on: On) {
   return w
 }
 
-const band = (bodyColumns = 120, hasSurvey = false) => ({
-  plugin: 'footprint',
-  component: 'AbovePrompt' as const,
-  props: { hasSurvey, isWorking: false, maxRows: 10, bodyColumns, scroll: { offset: 0, bodyRows: 10 }, view: {} },
-})
-
 type Engine = import('claude-code/testing').Engine
 
-async function bandText($: Engine, columns = 120, hasSurvey = false, surface: (typeof SURFACES)[number] = 'terminal') {
-  const ui = await $.ui.mount({ ...band(columns, hasSurvey), surface })
-  const found = await ui.find({ key: 'footprint-band' })
-  const engine = await ui.find({ type: 'Text', text: 'engine band' })
-  await ui.unmount()
-  return found?.text ?? (engine ? 'engine band' : '')
-}
-
-test('no infra calls: the engine band shows', async ($, on) => {
-  world(on)
-  await $.session.start(SESSION)
-  await $.tool.call({ tool: 'Bash', command: 'ls -la && git status' })
-  expect(await bandText($)).toBe('engine band')
-})
-
-test('band: notable scopes first, read-only last, failures marked', async ($, on) => {
-  world(on, { fails: c => c.includes('update-function'), env: { AWS_PROFILE: 'acct-a' } })
-  await $.session.start(SESSION)
-  await $.turn.start({ text: 'go', turnId: 't1' })
-  await $.tool.call({ tool: 'Bash', command: 'aws ec2 terminate-instances --instance-ids i-1' })
-  await $.tool.call({ tool: 'Bash', command: 'aws lambda update-function-configuration --function-name api' })
-  await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-b s3 ls s3://b' })
-  await $.tool.call({ tool: 'Bash', command: 'kubectl --context prod-eks -n web scale deploy api --replicas 2' })
-  for (const surface of SURFACES) {
-    expect(await bandText($, 120, false, surface)).toBe('aws acct-a w1 d1 ✗1 │ k8s prod-eks w1 │ acct-b r1')
-  }
-})
-
-test('band yields to a survey and truncates read-only scopes first', async ($, on) => {
+test('the mod never draws above the prompt', async ($, on) => {
   world(on)
   await $.session.start(SESSION)
   await $.tool.call({ tool: 'Bash', command: 'aws --profile a ec2 delete-vpc --vpc-id v' })
-  await $.tool.call({ tool: 'Bash', command: 'aws --profile b ec2 describe-vpcs' })
-  expect(await bandText($, 120, true)).toBe('engine band')
-  expect(await bandText($, 12)).toBe('aws a d1 +1')
+  const ui = await $.ui.mount({
+    plugin: 'footprint',
+    component: 'AbovePrompt' as const,
+    props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+    surface: 'terminal',
+  })
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['engine band'])
+  await ui.unmount()
 })
 
-test('denied calls are not recorded', async ($, on) => {
+test('no infra calls and denied calls are not recorded', async ($, on) => {
   world(on, { denies: c => c.includes('delete') })
   await $.session.start(SESSION)
+  await $.tool.call({ tool: 'Bash', command: 'ls -la && git status' })
   await $.tool.call({ tool: 'Bash', command: 'aws --profile a ec2 delete-vpc --vpc-id v' })
-  expect(await bandText($)).toBe('engine band')
+  expect(await paneText($)).toContain('No aws, kubectl or MCP calls yet.')
 })
 
-test('pane: tree with collapsed read-only group, notable rows visible', async ($, on) => {
+
+test('pane: sections by outcome, LOOKED AT folded to one line', async ($, on) => {
   await twoAccountsOneCluster($, on)
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ ...pane(), surface })
-    expect((await ui.find({ key: 'group-1' }))?.text).toBe('▾ aws › acct-a (1234…9012)')
-    expect((await ui.find({ key: 'group-2' }))?.text).toBe('▸ aws › acct-b (2109…4321) › us-e-1')
-    expect((await ui.find({ key: 'group-3' }))?.text).toBe('▾ k8s › prod-eks › web')
     const all = (await texts(ui)).join('\n')
-    expect(all).toContain('terminate-instances i-0abc')
-    expect(all).toContain('create db')
-    expect(all).toContain('pods · read-only (1)')
-    expect(await ui.find({ type: 'Button', text: /acct-b/ })).toMatchObject({ props: { hotkey: '2', plain: true } })
+    expect(all).toContain('CHANGED (2)')
+    expect(all).toContain('AWS account 123456789012 · ap-northeast-1')
+    expect(all).toContain('ec2 i-0abc  terminate-instances, worked')
+    expect(all).toContain('secret db  create, worked')
+    expect(all).toContain('LOOKED AT (5) · ec2, iam, s3, pods')
+    expect(all).not.toContain('210987654321')
+    expect(await ui.find({ type: 'Button', text: /^LOOKED AT/ })).toMatchObject({ props: { hotkey: 'l', plain: true } })
     await ui.unmount()
   }
 })
 
-test('pane: a group header toggles expanded', async ($, on) => {
+test('pane: LOOKED AT opens and folds', async ($, on) => {
   await twoAccountsOneCluster($, on)
   const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
-  await ui.press({ key: 'group-2' })
-  expect((await ui.find({ key: 'group-2' }))?.text).toBe('▾ aws › acct-b (2109…4321) › us-e-1')
-  expect((await texts(ui)).join('\n')).toContain('describe-vpcs')
-  await ui.press({ key: 'group-2' })
-  expect((await ui.find({ key: 'group-2' }))?.text).toBe('▸ aws › acct-b (2109…4321) › us-e-1')
+  await ui.press({ key: 'section-looked' })
+  const all = (await texts(ui)).join('\n')
+  expect(all).toContain('AWS account 210987654321 · us-east-1')
+  expect(all).toContain('describe-vpcs, worked')
+  expect(all).toContain('ran without error; results are not recorded')
+  await ui.press({ key: 'section-looked' })
+  expect((await texts(ui)).join('\n')).not.toContain('describe-vpcs')
   await ui.unmount()
 })
 
@@ -198,28 +183,84 @@ test('pane: write and turn filters', async ($, on) => {
   await twoAccountsOneCluster($, on)
   const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
   await ui.press({ key: 'filter-write' })
-  expect((await texts(ui)).join('\n')).not.toContain('acct-b')
-  expect((await texts(ui)).join('\n')).not.toContain('read-only')
+  expect((await texts(ui)).join('\n')).not.toContain('LOOKED AT')
   await ui.press({ key: 'filter-turn' })
-  expect((await ui.find({ key: 'group-1' }))?.text).toBe('▾ k8s › prod-eks › web')
+  const turn = (await texts(ui)).join('\n')
+  expect(turn).toContain('Kubernetes prod-eks · namespace web')
+  expect(turn).not.toContain('AWS account')
   await ui.press({ key: 'filter-all' })
-  expect(await ui.find({ key: 'group-3' })).toBeDefined()
+  expect((await texts(ui)).join('\n')).toContain('AWS account')
   await ui.unmount()
 })
 
-test('pane: selecting a row shows its redacted command, never the output', async ($, on) => {
+test('pane: selecting a row lists every call behind it, redacted, never the output', async ($, on) => {
   await twoAccountsOneCluster($, on)
   const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
-  const row = await ui.find({ type: 'Button', text: /secrets/ })
+  const row = await ui.find({ type: 'Button', text: /secret db/ })
   expect(row).toBeDefined()
   await ui.press({ key: row!.key! })
-  const detail = await ui.find({ key: 'detail-cmd' })
-  expect(detail?.text).toBe('$ kubectl --context prod-eks -n web create secret generic db --from-literal=password=***')
   const all = (await texts(ui)).join('\n')
+  expect(all).toContain('secret db · create · 1 call')
+  expect((await ui.find({ key: 'detail-call-0' }))?.text).toMatch(/^ {2}\d\d:\d\d {2}worked$/)
+  expect((await ui.find({ key: 'detail-cmd-0' }))?.text).toBe('    kubectl --context prod-eks -n web create secret generic db --from-literal=password=***')
   expect(all).not.toContain('hunter2')
   expect(all).not.toContain('SECRET-OUTPUT')
-  expect(all).toContain('this turn')
   await ui.unmount()
+})
+
+test('pane: detail adds the aws profile only when the command does not name it', async ($, on) => {
+  const w = world(on, { run: hostRun, fails: c => c.includes('acct-a-admin'), env: { AWS_PROFILE: 'acct-a' } })
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-a-admin ec2 describe-vpcs' })
+  await $.tool.call({ tool: 'Bash', command: 'aws ec2 describe-vpcs' })
+  await w.clock.settle()
+  const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
+  await ui.press({ key: 'section-looked' })
+  const row = await ui.find({ type: 'Button', text: /ec2/ })
+  await ui.press({ key: row!.key! })
+  const all = (await texts(ui)).join('\n')
+  expect(all).toContain('ec2  describe-vpcs, 2 calls, last worked')
+  expect(all).toContain('ec2 · describe-vpcs · 2 calls, 2 different commands')
+  expect((await ui.find({ key: 'detail-call-0' }))?.text).toMatch(/^ {2}\d\d:\d\d {2}failed$/)
+  expect((await ui.find({ key: 'detail-call-1' }))?.text).toMatch(/^ {2}\d\d:\d\d {2}worked {2}profile acct-a$/)
+  await ui.unmount()
+})
+
+test('pane: detail shows the Bash description beside each call', async ($, on) => {
+  world(on)
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile a rds describe-db-instances', description: 'List RDS instances ghp_abcdefghijklmnopqrstuvwxyz0123456789' })
+  const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
+  await ui.press({ key: 'section-looked' })
+  await ui.press({ key: (await ui.find({ type: 'Button', text: /rds/ }))!.key! })
+  expect((await ui.find({ key: 'detail-call-0' }))?.text).toMatch(/^ {2}\d\d:\d\d {2}worked {2}List RDS instances \*\*\*$/)
+  await ui.unmount()
+})
+
+test('/map export writes every call as JSON lines outside the repo', async ($, on) => {
+  const w = world(on, { env: { HOME: '/home/me' }, fails: c => c.includes('delete') })
+  const clipboard: string[] = []
+  let isRefused = false
+  on('ui.copy', ($, e) => {
+    if (isRefused) return { value: { isCopied: false as const, reason: 'no-clipboard' as const } }
+    clipboard.push(e.text)
+    return { value: { isCopied: true as const } }
+  })
+  await $.session.start(SESSION)
+  expect((await $.command.run(map('export'))).text).toBe('Footprint: nothing to export yet.')
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile a ec2 describe-vpcs', description: 'List VPCs' })
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile a ec2 delete-vpc --vpc-id v-1' })
+  expect((await $.command.run(map('export'))).text).toBe(
+    'Footprint: 2 calls written to /home/me/.claude/footprint/trace-sess-1.jsonl. Path copied.',
+  )
+  expect(clipboard).toEqual(['/home/me/.claude/footprint/trace-sess-1.jsonl'])
+  isRefused = true
+  expect((await $.command.run(map('export'))).text).toEndWith('.jsonl. Path not copied (no-clipboard).')
+  const lines = w.written['/home/me/.claude/footprint/trace-sess-1.jsonl']!.trim().split('\n').map(l => JSON.parse(l))
+  expect(lines).toHaveLength(2)
+  expect(lines[0]).toMatchObject({ outcome: 'worked', class: 'read', tool: 'aws', profile: 'a', object: 'ec2', operation: 'describe-vpcs', description: 'List VPCs' })
+  expect(lines[1]).toMatchObject({ outcome: 'failed', class: 'destructive', object: 'ec2 v-1', command: 'aws --profile a ec2 delete-vpc --vpc-id v-1' })
+  expect(JSON.stringify(lines)).not.toContain('SECRET-OUTPUT')
 })
 
 test('/map toggles the pane; filters open it', async ($, on) => {
@@ -234,29 +275,39 @@ test('/map toggles the pane; filters open it', async ($, on) => {
   expect((await $.command.run(map('nope'))).text).toContain('/map toggles the pane')
 })
 
-test('/map on a narrow terminal falls back to the band', async ($, on) => {
+test('/map on a narrow terminal says so and keeps recording', async ($, on) => {
   const w = world(on, { narrow: true })
   await $.session.start(SESSION)
   await $.tool.call({ tool: 'Bash', command: 'aws --profile a ec2 describe-vpcs' })
   expect((await $.command.run(map())).text).toContain('too narrow')
   expect(w.panes.has('footprint')).toBe(false)
-  expect(await bandText($)).toBe('aws a r1')
+  expect(await paneText($)).toContain('ec2  describe-vpcs, worked')
 })
 
-test('/map clear empties the map; /map collapse folds groups', async ($, on) => {
+test('/map clear empties the map; /map collapse folds LOOKED AT', async ($, on) => {
   await twoAccountsOneCluster($, on)
   const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
-  await ui.press({ key: 'group-2' })
-  await $.command.run(map('collapse'))
-  expect((await ui.find({ key: 'group-2' }))?.text).toBe('▸ aws › acct-b (2109…4321) › us-e-1')
+  await ui.press({ key: 'section-looked' })
+  expect((await $.command.run(map('collapse'))).text).toBe('Footprint: LOOKED AT folded.')
+  expect((await ui.find({ key: 'section-looked' }))?.text).toBe('LOOKED AT (5) · ec2, iam, s3, pods')
   await $.command.run(map('clear'))
-  expect((await texts(ui)).join('\n')).toContain('No aws or kubectl calls yet.')
-  expect(await bandText($)).toBe('engine band')
+  expect((await texts(ui)).join('\n')).toContain('No aws, kubectl or MCP calls yet.')
   await ui.unmount()
 })
 
+test('history cap: the pane says older calls were dropped', async ($, on) => {
+  world(on)
+  await $.session.start(SESSION)
+  for (let i = 0; i < 501; i++) await $.tool.call({ tool: 'Bash', command: `aws --profile a ec2 describe-vpcs --vpc-ids v-${i}` })
+  expect(await paneText($)).toContain('older calls dropped')
+  await $.command.run(map('clear'))
+  expect(await paneText($)).not.toContain('older calls dropped')
+})
+
+/** Pane text below the filter bar, LOOKED AT opened. */
 async function paneText($: Engine): Promise<string> {
   const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
+  if ((await ui.find({ key: 'section-looked' }))?.text.includes(' · ')) await ui.press({ key: 'section-looked' })
   const all = (await texts(ui)).slice(1).join('\n')
   await ui.unmount()
   return all
@@ -269,8 +320,8 @@ test('scope: two profiles on one account merge; the caller ARN is never kept', a
   await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-a-admin ec2 delete-vpc --vpc-id vpc-1' })
   await w.clock.settle()
   const all = await paneText($)
-  expect(all).toContain('▾ aws › acct-a (1234…9012) › ap-ne-1')
-  expect(all).not.toContain('acct-a-admin (')
+  expect(all.split('\n').filter(l => l.includes('AWS account 123456789012 · ap-northeast-1'))).toHaveLength(2)
+  expect(all).not.toContain('acct-a')
   expect(all).not.toContain('assumed-role')
 })
 
@@ -279,15 +330,15 @@ test('scope: process AWS_PROFILE/AWS_REGION apply when the command names none', 
   await $.session.start(SESSION)
   await $.tool.call({ tool: 'Bash', command: 'aws ec2 describe-vpcs' })
   await w.clock.settle()
-  expect(await paneText($)).toContain('aws › acct-b (2109…4321) › eu-w-1')
+  expect(await paneText($)).toContain('AWS account 210987654321 · eu-west-1')
 })
 
-test('scope: an unresolvable profile shows (?) and region ?', async ($, on) => {
+test('scope: an unresolvable profile says account unknown and region unknown', async ($, on) => {
   const w = world(on, { run: hostRun })
   await $.session.start(SESSION)
   await $.tool.call({ tool: 'Bash', command: 'aws --profile ghost ec2 describe-vpcs' })
   await w.clock.settle()
-  expect(await paneText($)).toContain('aws › ghost (?) › ?')
+  expect(await paneText($)).toContain('AWS profile ghost · account unknown · region unknown')
 })
 
 test('kubectl: default namespace from the kubeconfig; use-context pins earlier rows', async ($, on) => {
@@ -299,10 +350,8 @@ test('kubectl: default namespace from the kubeconfig; use-context pins earlier r
   await $.tool.call({ tool: 'Bash', command: 'kubectl scale deploy api --replicas 0' })
   await w.clock.settle()
   const all = await paneText($)
-  expect(all).toContain('▾ k8s › prod-eks › web')
-  expect(all).toContain('delete web-1')
-  expect(all).toContain('▾ k8s › staging')
-  expect(all).toContain('scale api')
+  expect(all).toMatch(/Kubernetes prod-eks · namespace web\n\s+pod web-1 {2}delete, worked/)
+  expect(all).toMatch(/Kubernetes staging · namespace default\n\s+deployment api {2}scale, worked/)
 })
 
 test('kubectl -f: kind and name come from the manifest file', async ($, on) => {
@@ -317,27 +366,74 @@ test('kubectl -f: kind and name come from the manifest file', async ($, on) => {
   await $.tool.call({ tool: 'Bash', command: 'kubectl --context prod-eks apply -f missing.yaml' })
   await w.clock.settle()
   const all = await paneText($)
-  expect(all).toMatch(/edge\s+deployments\s+w1 · apply api/)
-  expect(all).toMatch(/cluster\s+clusterroles\s+w1 · apply reader/)
-  expect(all).toMatch(/manifest\s+w1 · apply missing.yaml/)
+  expect(all).toMatch(/namespace edge\n\s+deployment api {2}apply, worked/)
+  expect(all).toMatch(/cluster-wide\n\s+clusterrole reader {2}apply, worked/)
+  expect(all).toContain('manifest missing.yaml  apply, worked')
 })
 
-test('edges: assume-role and update-kubeconfig show as link rows', async ($, on) => {
+test('edges: assume-role and update-kubeconfig say what they open, under their row', async ($, on) => {
   const w = world(on, { run: hostRun })
   await $.session.start(SESSION)
   await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-b sts get-caller-identity' })
   await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-a sts assume-role --role-arn arn:aws:iam::210987654321:role/Deploy --role-session-name s' })
   await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-a eks update-kubeconfig --name prod-eks' })
   await w.clock.settle()
-  expect(await paneText($)).toContain('→ link: aws acct-b (2109…4321) (role Deploy) · k8s prod-eks')
+  const all = await paneText($)
+  expect(all).toMatch(/sts Deploy {2}assume-role, worked\n\s+opens AWS account 210987654321, role Deploy/)
+  expect(all).toMatch(/eks prod-eks {2}update-kubeconfig, worked\n\s+opens Kubernetes prod-eks/)
 })
 
-test('a failed call is marked and its badge counted', async ($, on) => {
-  const w = world(on, { run: hostRun, fails: c => c.includes(' rm ') })
+test('a failed change sits under FAILED and says it was a change; colour stays the class', async ($, on) => {
+  const w = world(on, { run: hostRun, fails: c => c.includes('s3://b') })
   await $.session.start(SESSION)
   await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-a s3 rm s3://b/k' })
+  await $.tool.call({ tool: 'Bash', command: 'aws --profile acct-a s3 ls s3://b' })
   await w.clock.settle()
   const all = await paneText($)
-  expect(all).toContain('d1 ✗1')
-  expect(all).toContain('· ✗ rm s3://b/k')
+  expect(all).toMatch(/FAILED, NEVER SUCCEEDED \(2\)\n\s+AWS account 123456789012 · ap-northeast-1\n\s+s3 s3:\/\/b\/k {2}rm \(change\), failed/)
+  const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: 'rm (change), failed' }))?.props.color).toBe('red')
+  expect((await ui.find({ type: 'Text', text: 'ls, failed' }))?.props.color).toBeUndefined()
+  await ui.unmount()
+})
+
+test('mcp: writes and unknowns drawn, reads and denied calls dropped', async ($, on) => {
+  world(on, { readOnly: t => t.endsWith('__describe_job'), denies: t => t.endsWith('__delete_job') })
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'mcp__jenkins__get_build_log', name: 'deploy-api' })
+  await $.tool.call({ tool: 'mcp__jenkins__describe_job', name: 'deploy-api' })
+  await $.tool.call({ tool: 'mcp__jenkins__delete_job', name: 'deploy-api' })
+  await $.tool.call({ tool: 'mcp__ccd_session__spawn_task', title: 't' })
+  expect(await paneText($)).toContain('No aws, kubectl or MCP calls yet.')
+  await $.tool.call({ tool: 'mcp__jenkins__stop_build', name: 'deploy-api' })
+  await $.tool.call({ tool: 'mcp__hn__hn_comments', id: 1 })
+  const all = await paneText($)
+  expect(all).toMatch(/CHANGED \(1\)\n\s+jenkins\n\s+deploy-api {2}stop_build, worked/)
+  expect(all).toMatch(/MAY HAVE CHANGED \(1\)\n\s+hn\n\s+1 {2}hn_comments, worked/)
+  expect(all).not.toContain('get_build_log')
+  expect(all).not.toContain('describe_job')
+  expect(all).not.toContain('delete_job')
+})
+
+test('mcp: a server read-only flag beats a write-looking name', async ($, on) => {
+  world(on, { readOnly: t => t.endsWith('__send_report') })
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'mcp__mail__send_report', name: 'weekly' })
+  expect(await paneText($)).toContain('No aws, kubectl or MCP calls yet.')
+})
+
+test('mcp: server is the scope line; detail shows allowlisted args, never bodies or output', async ($, on) => {
+  world(on)
+  await $.session.start(SESSION)
+  await $.tool.call({ tool: 'mcp__slack__slack_send_message', channel_id: 'C123', text: 'hunter2 is the password' })
+  const ui = await $.ui.mount({ ...pane(), surface: 'terminal' })
+  const row = await ui.find({ type: 'Button', text: /C123/ })
+  expect(row).toBeDefined()
+  await ui.press({ key: row!.key! })
+  expect((await ui.find({ key: 'detail-cmd-0' }))?.text).toBe('    slack_send_message channel_id=C123')
+  const all = (await texts(ui)).join('\n')
+  expect(all).toMatch(/CHANGED \(1\)\n\s+slack\n\s+C123 {2}slack_send_message, worked/)
+  expect(all).not.toContain('hunter2')
+  expect(all).not.toContain('SECRET-OUTPUT')
+  await ui.unmount()
 })

@@ -1,6 +1,7 @@
 // Pure: parsed actions to stored events. Scope gaps stay open and are filled at draw time.
 import type { KubeInfo, MapEvent, ProfileInfo } from '../types'
 
+import type { McpCall } from './mcp'
 import type { Action } from './parse'
 
 export const HISTORY_CAP = 500
@@ -11,6 +12,8 @@ export type RecordEnv = {
   ok: boolean
   /** Already redacted. */
   cmd: string
+  /** Already redacted. */
+  description?: string
   /** `AWS_PROFILE` of the Claude Code process, when set. */
   awsProfile?: string
   /** `AWS_REGION` / `AWS_DEFAULT_REGION` of the Claude Code process, when set. */
@@ -22,7 +25,7 @@ export type RecordEnv = {
 type NewEvent = MapEvent extends infer E ? (E extends MapEvent ? Omit<E, 'id'> : never) : never
 
 export function eventsOf(actions: Action[], env: RecordEnv): NewEvent[] {
-  const base = { ts: env.ts, turnId: env.turnId, ok: env.ok, cmd: env.cmd }
+  const base = { ts: env.ts, turnId: env.turnId, ok: env.ok, source: 'cli' as const, cmd: env.cmd, ...(env.description ? { description: env.description } : {}) }
   return actions.map((a): NewEvent => {
     if (a.tool === 'aws') {
       const profile = a.profile ?? env.awsProfile ?? 'default'
@@ -49,6 +52,21 @@ export function eventsOf(actions: Action[], env: RecordEnv): NewEvent[] {
       scope: { context: a.context ?? env.kube?.current, namespace: a.namespace },
     }
   })
+}
+
+export function mcpEventOf(call: McpCall, env: Pick<RecordEnv, 'ts' | 'turnId' | 'ok'>): NewEvent {
+  return {
+    ts: env.ts,
+    turnId: env.turnId,
+    ok: env.ok,
+    source: 'mcp',
+    cmd: call.display,
+    tool: 'mcp',
+    server: call.server,
+    verb: call.name,
+    resource: call.target,
+    cls: call.cls,
+  }
 }
 
 /** Appends with fresh ids, keeping the newest `cap`. */

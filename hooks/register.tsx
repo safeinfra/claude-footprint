@@ -1,18 +1,20 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderChildren } from 'claude-code'
+import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
 import type { Cls, Filter, MapEvent } from '../types'
 
 import { analyze, CLUSTER_KINDS, CLUSTER_NS, mentionsInfra, normalizeKind, parseManifest, redact } from './parse'
 import type { Action } from './parse'
-import { appendEvents, eventsOf } from './record'
-import { badges, bandTokens, buildGroups, groupHeader, noteText, rowsOf, scopeText } from './view'
-import type { Ctx, Row } from './view'
+import { isKept, mcpCall } from './mcp'
+import { appendEvents, eventsOf, mcpEventOf } from './record'
+import { buildMap, detailLines, LOOKED_OPEN, paneRows, traceJsonl } from './view'
+import type { Ctx, PaneRow } from './view'
 
 const PANE = 'footprint'
 const COMMAND = 'map'
 const FILTERS: readonly Filter[] = ['all', 'write', 'turn']
-const USAGE = '/map toggles the pane; /map all|write|turn filters it; /map collapse folds groups; /map clear empties the map.'
+const USAGE =
+  '/map toggles the pane; /map all|write|turn filters it; /map collapse folds LOOKED AT; /map export writes every call to a file; /map clear empties the map.'
 
 const events = atom({ plugin: 'footprint', key: 'events' } as const, [] as MapEvent[])
 const turn = atom({ plugin: 'footprint', key: 'turnId' } as const, null)
@@ -22,14 +24,15 @@ const selected = atom({ plugin: 'footprint', key: 'selected' } as const, null)
 const profiles = atom({ plugin: 'footprint', key: 'profiles' } as const, {})
 const kube = atom({ plugin: 'footprint', key: 'kube' } as const, null)
 const unparsed = atom({ plugin: 'footprint', key: 'unparsed' } as const, 0)
+const dropped = atom({ plugin: 'footprint', key: 'dropped' } as const, 0)
 
-const COLOR: Record<Cls | 'failed', string | undefined> = {
+const COLOR: Record<Cls, string | undefined> = {
   read: undefined,
   write: 'yellow',
   destructive: 'red',
   cred: 'magenta',
   interactive: 'cyan',
-  failed: 'red',
+  unknown: undefined,
 }
 const ACCENT = 'cyan'
 
@@ -93,7 +96,7 @@ const pinContext = (list: MapEvent[], context: string): MapEvent[] =>
   list.map(e => (e.tool === 'kubectl' && e.scope.context === undefined ? { ...e, scope: { ...e.scope, context } } : e))
 
 /** Starts each lookup once: marks it pending, then runs it from a timer so the tool call never waits. */
-async function kick($: EngineInterface, add: readonly ({ tool: 'aws'; scope: { profile: string } } | { tool: 'kubectl' })[]): Promise<void> {
+async function kick($: EngineInterface, add: readonly ({ tool: 'aws'; scope: { profile: string } } | { tool: 'kubectl' | 'mcp' })[]): Promise<void> {
   const names = new Set(add.flatMap(e => (e.tool === 'aws' ? [e.scope.profile] : [])))
   for (const profile of names) {
     let isMine = false
@@ -145,7 +148,18 @@ async function expandManifests($: EngineInterface, actions: Action[]): Promise<A
   return out
 }
 
-async function record($: EngineInterface, command: string, ok: boolean): Promise<void> {
+/** Appends under the history cap and counts what the cap pushed out, so the pane can say so. */
+async function append($: EngineInterface, add: Parameters<typeof appendEvents>[1]): Promise<void> {
+  let lost = 0
+  await update($, events, list => {
+    const next = appendEvents(list, add)
+    lost = list.length + add.length - next.length
+    return next
+  })
+  if (lost > 0) await update($, dropped, n => n + lost)
+}
+
+async function record($: EngineInterface, command: string, description: string, ok: boolean): Promise<void> {
   const found = analyze(command)
   if (found.actions.length === 0 && found.unparsed === 0) return
   if (found.unparsed > 0) await update($, unparsed, n => n + found.unparsed)
@@ -159,12 +173,13 @@ async function record($: EngineInterface, command: string, ok: boolean): Promise
     turnId: await read($, turn),
     ok,
     cmd: redact(command).slice(0, 4000),
+    description: redact(description).trim().slice(0, 200) || undefined,
     awsProfile: hasAws ? await $.env.get('AWS_PROFILE') : undefined,
     awsRegion: hasAws ? (await $.env.get('AWS_REGION')) ?? (await $.env.get('AWS_DEFAULT_REGION')) : undefined,
     profiles: await read($, profiles),
     kube: await read($, kube),
   })
-  await update($, events, list => appendEvents(list, add))
+  await append($, add)
 
   // `config use-context X`: earlier rows keep the old context, later ones get X.
   const switched = ok ? actions.findLast(a => a.tool === 'kubectl' && a.useContext !== undefined) : undefined
@@ -181,9 +196,31 @@ async function ctxOf($: EngineInterface, view: Pick<Ctx, 'filter' | 'expanded'>)
   return { profiles: await read($, profiles), kube: await read($, kube), turnId: await read($, turn), ...view }
 }
 
+/**
+ * Every recorded call, unfiltered, to `~/.claude/footprint/trace-<session>.jsonl`; a later
+ * export of the same session overwrites it. Outside the repo so it never lands in a commit.
+ * The path goes on the clipboard of `surface` (the pressing one), else the session's first.
+ */
+async function exportTrace($: EngineInterface, surface?: RenderSurface): Promise<string> {
+  const list = await read($, events)
+  if (list.length === 0) return 'Footprint: nothing to export yet.'
+  const home = await $.env.get('HOME')
+  if (!home) return 'Footprint: HOME is not set; nothing written.'
+  const path = `${home}/.claude/footprint/trace-${await $.session.id()}.jsonl`
+  try {
+    await $.fs.write(path, traceJsonl(list, { profiles: await read($, profiles), kube: await read($, kube) }))
+  } catch (err) {
+    return `Footprint: export failed: ${err instanceof Error ? err.message : String(err)}`
+  }
+  const lost = await read($, dropped)
+  const copy = await $.ui.copy({ text: path, ...(surface ? { surface } : {}) }).catch(() => ({ isCopied: false as const, reason: 'refused' }))
+  const copied = copy.isCopied ? ' Path copied.' : ` Path not copied (${copy.reason}).`
+  return `Footprint: ${list.length} calls written to ${path}${lost > 0 ? ` (${lost} older calls were dropped before export)` : ''}.${copied}`
+}
+
 const isPaneUp = async ($: EngineInterface) => (await $.ui.panes()).some(p => p.id === PANE)
 
-/** Opens the pane; on a terminal too narrow to seat it, closes it again so the band is the view. */
+/** Opens the pane; on a terminal too narrow to seat it, closes it again. */
 async function openPane($: EngineInterface): Promise<boolean> {
   const opened = await $.ui.open({ id: PANE, title: 'Footprint' })
   if (opened.isPlaced) return true
@@ -191,15 +228,15 @@ async function openPane($: EngineInterface): Promise<boolean> {
   return false
 }
 
-const NARROW = 'Footprint: the terminal is too narrow for the pane; the band above the prompt keeps the summary.'
+const NARROW = 'Footprint: the terminal is too narrow for the pane; widen it or use /map export.'
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.command.register({
       name: COMMAND,
-      description: 'Footprint: map of the aws/kubectl calls this session made',
-      argumentHint: '[all|write|turn|collapse|clear]',
+      description: 'Footprint: map of the aws/kubectl and MCP calls this session made',
+      argumentHint: '[all|write|turn|collapse|export|clear]',
       immediate: true,
     })
     // A hot reload drops pending timers: restart lookups the old module left pending.
@@ -216,15 +253,23 @@ export const register: Register = on => {
   })
 
   // Observe only: the call always runs as asked and its result goes back untouched.
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+  // No matcher: Bash and every `mcp__*` tool come through here.
+  on('tool.call', async ($, e, next) => {
     const ran = await next(e)
-    const command = String(e.command ?? '')
-    if (ran.deny === undefined && mentionsInfra(command)) {
-      try {
-        await record($, command, ran.isError !== true)
-      } catch {
-        // A map that misses a row beats a tool call that fails.
+    if (ran.deny !== undefined) return ran
+    try {
+      if (e.tool === 'Bash') {
+        const command = String(e.command ?? '')
+        if (mentionsInfra(command)) await record($, command, String(e.description ?? ''), ran.isError !== true)
+      } else {
+        const call = mcpCall(e.tool, e as Readonly<Record<string, unknown>>, ran.isReadOnly === true)
+        if (call && isKept(call)) {
+          const add = mcpEventOf(call, { ts: await $.clock.now(), turnId: await read($, turn), ok: ran.isError !== true })
+          await append($, [add])
+        }
       }
+    } catch {
+      // A map that misses a row beats a tool call that fails.
     }
     return ran
   })
@@ -242,13 +287,15 @@ export const register: Register = on => {
       await update($, filter, () => arg as Filter)
       return { text: (await openPane($)) ? `Footprint: showing ${arg}.` : NARROW }
     }
+    if (arg === 'export') return { text: await exportTrace($) }
     if (arg === 'collapse') {
       await update($, expanded, () => ({}))
-      return { text: 'Footprint: groups folded.' }
+      return { text: 'Footprint: LOOKED AT folded.' }
     }
     if (arg === 'clear') {
       await update($, events, () => [])
       await update($, unparsed, () => 0)
+      await update($, dropped, () => 0)
       await update($, selected, () => null)
       // Forget lookups too, so a profile that failed (expired SSO) is asked again.
       await update($, profiles, () => ({}))
@@ -258,31 +305,6 @@ export const register: Register = on => {
     return { text: USAGE }
   })
 
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey) return next(e)
-    const list = await read($, events)
-    if (list.length === 0) return next(e)
-    const groups = buildGroups(list, await ctxOf($, { filter: 'all', expanded: {} }))
-    if (groups.length === 0) return next(e)
-    const { tokens, dropped } = bandTokens(groups, e.props.bodyColumns)
-    const { Box, Text } = await $.ui.resolve(e)
-    const parts: RenderChildren[] = []
-    tokens.forEach((t, i) => {
-      if (i > 0) parts.push(<Text dimColor> │ </Text>)
-      if (t.prefix) parts.push(<Text bold>{t.prefix} </Text>)
-      parts.push(<Text>{t.label}</Text>)
-      for (const [b, cls] of t.badges) {
-        parts.push(<Text color={COLOR[cls]} dimColor={cls === 'read'}> {b}</Text>)
-      }
-    })
-    if (dropped > 0) parts.push(<Text dimColor> +{dropped}</Text>)
-    return (
-      <Box key="footprint-band">
-        <Text wrap="truncate-end">{parts}</Text>
-      </Box>
-    )
-  })
-
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = await $.ui.resolve(e)
     const list = await read($, events)
@@ -290,73 +312,63 @@ export const register: Register = on => {
     const ctx = await ctxOf($, view)
     const chosen = await read($, selected)
     const skipped = await read($, unparsed)
-    const groups = buildGroups(list, ctx)
+    const lost = await read($, dropped)
+    const sections = buildMap(list, ctx)
     const width = Math.max(20, e.props.bodyColumns)
     const fit = (s: string, room = width) => (s.length > room ? `${s.slice(0, Math.max(1, room - 1))}…` : s)
-    const select = (id: number) => () => update($, selected, cur => (cur === id ? null : id))
     const marker = (isCurrent: boolean) => <Text color={ACCENT}>{isCurrent ? '•' : ' '}</Text>
-    const badgeTexts = (bs: [string, Cls | 'failed'][]) =>
-      bs.map(([b, cls]) => <Text color={COLOR[cls]} dimColor={cls === 'read'}> {b}</Text>)
+    const toggleLooked = () => update($, expanded, m => ({ ...m, [LOOKED_OPEN]: m[LOOKED_OPEN] !== true }))
 
-    const drawRow = (r: Row) => {
-      if (r.type === 'links') return <Box><Text wrap="truncate-end">{r.text}</Text></Box>
-      if (r.type === 'group') {
-        const g = r.group
-        const head = groupHeader(g)
-        const toggle = () => update($, expanded, m => ({ ...m, [g.key]: m[g.key] !== true }))
-        const hotkey = r.index < 9 ? { hotkey: String(r.index + 1) } : {}
+    // Colour is class only; failure is told by the section a row sits in.
+    const drawRow = (r: PaneRow) => {
+      if (r.type === 'section') {
+        if (!r.isFoldable) {
+          return (
+            <Box key={`box-${r.key}`}>
+              <Text> </Text>
+              <Text bold wrap="truncate-end">{r.text}</Text>
+            </Box>
+          )
+        }
         return (
-          <Box flexDirection="row">
-            {marker(g.isCurrent)}
-            <Button key={r.key} plain {...hotkey} label={fit(`${head.marker} ${head.title}`, width - 12)} dimColor={!g.isCurrent && !g.isNotable} onPress={toggle} />
-            <Text wrap="truncate-end">
-              {badgeTexts(head.badges)}
-              <Text dimColor>{head.extra}</Text>
-            </Text>
+          <Box key={`box-${r.key}`} flexDirection="row">
+            {marker(false)}
+            <Button key={r.key} plain hotkey="l" label={fit(r.text, width - 2)} onPress={toggleLooked} />
           </Box>
         )
       }
-      const l = r.line
-      if (l.type === 'more') return <Box><Text dimColor>{` ${r.prefix}    +${l.count} more`}</Text></Box>
-      if (l.type === 'res') {
+      if (r.type !== 'call') {
         return (
-          <Box flexDirection="row">
-            {marker(l.isCurrent)}
-            <Text>{`${r.prefix}  `}</Text>
-            <Text color={COLOR[l.note.ok ? l.note.cls : 'failed']}>› </Text>
-            <Button key={r.key} plain label={fit(noteText(l.note), width - r.prefix.length - 6)} dimColor={!l.isCurrent} onPress={select(l.eventId)} />
+          <Box key={`box-${r.key}`}>
+            <Text dimColor={r.type === 'note'} wrap="truncate-end">{` ${r.text}`}</Text>
           </Box>
         )
       }
-      if (l.type === 'reads') {
-        return (
-          <Box flexDirection="row">
-            {marker(l.isCurrent)}
-            <Button key={r.key} plain label={fit(`${r.prefix}${l.names.join(', ')}`, width - 20)} dimColor onPress={select(l.eventId)} />
-            <Text dimColor wrap="truncate-end">{` · read-only (${l.total})`}</Text>
-          </Box>
-        )
-      }
-      const note = l.note
+      const row = r.row
       return (
-        <Box flexDirection="row">
-          {marker(l.isCurrent)}
-          <Button key={r.key} plain label={fit(`${r.prefix}${l.name}`, width - 12)} dimColor={!l.isCurrent} onPress={select(l.eventId)} />
-          <Text wrap="truncate-end">
-            {badgeTexts(badges(l.counts))}
-            {note ? <Text color={COLOR[note.ok ? note.cls : 'failed']}>{` · ${noteText(note)}`}</Text> : null}
-          </Text>
+        <Box key={`box-${r.key}`} flexDirection="row">
+          {marker(row.isCurrent)}
+          <Button
+            key={r.key}
+            plain
+            label={fit(r.object, Math.max(8, width - 12))}
+            dimColor={!row.isCurrent}
+            onPress={() => update($, selected, cur => (cur === row.key ? null : row.key))}
+          />
+          <Text color={COLOR[row.cls]} wrap="truncate-end">{r.text}</Text>
         </Box>
       )
     }
 
-    const event = chosen === null ? undefined : list.find(ev => ev.id === chosen)
+    const row = chosen === null ? undefined : sections.flatMap(s => s.scopes.flatMap(b => b.rows)).find(r => r.key === chosen)
+    const detail = row ? detailLines(row) : undefined
     const empty =
       list.length === 0
-        ? 'No aws or kubectl calls yet.'
+        ? 'No aws, kubectl or MCP calls yet.'
         : view.filter === 'turn'
           ? 'Nothing in this turn yet.'
           : 'Nothing matches this filter.'
+    const isEmpty = sections.every(s => s.rows === 0)
 
     return (
       <Box flexDirection="column">
@@ -365,23 +377,47 @@ export const register: Register = on => {
             <Button key={`filter-${f}`} label={f} hotkey={f[0]!} variant={f === view.filter ? 'primary' : 'secondary'} onPress={() => update($, filter, () => f)} />
           ))}
           <Button key="collapse" label="collapse" hotkey="c" onPress={() => update($, expanded, () => ({}))} />
+          <Button key="export" label="export" hotkey="e" onPress={async press => $.ui.toast(await exportTrace($, press.surface))} />
         </Box>
-        {groups.length === 0 ? <Text dimColor>{empty}</Text> : rowsOf(groups).map(drawRow)}
-        <Text dimColor>{'─'.repeat(Math.min(width, 48))}</Text>
-        {event ? (
-          <Box key="detail" flexDirection="column">
-            <Text wrap="truncate-end">
-              <Text color={COLOR[event.ok ? event.cls : 'failed']}>{`${event.ok ? '' : '✗ '}${event.cls}`}</Text>
-              <Text dimColor>{` · ${scopeText(event, ctx)}${event.turnId !== null && event.turnId === ctx.turnId ? ' · this turn' : ''}`}</Text>
-            </Text>
-            <Box key="detail-cmd">
-              <Text wrap="wrap">{`$ ${event.cmd}`}</Text>
-            </Box>
+        {lost > 0 ? (
+          <Box key="dropped">
+            <Text dimColor>older calls dropped</Text>
+          </Box>
+        ) : null}
+        {isEmpty ? (
+          <Box key="empty">
+            <Text dimColor>{empty}</Text>
           </Box>
         ) : (
-          <Text dimColor wrap="truncate-end">
-            {`Select a row to see its command.${skipped > 0 ? ` Unparsed: ${skipped}.` : ''}`}
-          </Text>
+          paneRows(sections, view.expanded).map(drawRow)
+        )}
+        {skipped > 0 ? (
+          <Box key="not-tracked" flexDirection="column">
+            <Text> </Text>
+            <Text bold> NOT TRACKED</Text>
+            <Text dimColor wrap="truncate-end">{`   aws or kubectl commands the map could not read: ${skipped}`}</Text>
+          </Box>
+        ) : null}
+        <Text dimColor>{'─'.repeat(Math.min(width, 48))}</Text>
+        {row && detail ? (
+          <Box key="detail" flexDirection="column">
+            <Text bold wrap="truncate-end">{detail.head}</Text>
+            <Text dimColor wrap="truncate-end">{detail.where}</Text>
+            {detail.calls.flatMap((c, i) => [
+              // Long commands wrap; a light rule keeps each call apart.
+              <Box key={`detail-rule-${i}`}>
+                <Text dimColor>{`  ${'┄'.repeat(Math.max(1, Math.min(width, 48) - 2))}`}</Text>
+              </Box>,
+              <Box key={`detail-call-${i}`}>
+                <Text wrap="wrap">{`  ${c.head}`}</Text>
+              </Box>,
+              <Box key={`detail-cmd-${i}`}>
+                <Text dimColor wrap="wrap">{`    ${c.cmd}`}</Text>
+              </Box>,
+            ])}
+          </Box>
+        ) : (
+          <Text dimColor wrap="truncate-end">Select a row to see every call behind it.</Text>
         )}
       </Box>
     )

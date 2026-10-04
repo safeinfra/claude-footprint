@@ -1,7 +1,9 @@
 {
   "name": "footprint",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Live map of the aws and kubectl commands and MCP tool calls Claude runs: which account, region, cluster and namespace were touched, and whether each action read, wrote, destroyed or exposed credentials.",
-  "author": { "name": "nguyen.duy.vu" },
+  "author": {
+    "name": "nguyen.duy.vu"
+  },
   "types": "./types/index.d.ts"
 }
